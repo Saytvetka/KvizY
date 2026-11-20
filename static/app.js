@@ -136,6 +136,34 @@ function startBootTicker() {
   bootTicker = setInterval(tick, 250);
 }
 function stopBootTicker() { clearInterval(bootTicker); bootTicker = null; }
+
+/** Ожидание с «живым» текстом: texts — [[с какой секунды, текст], …]. Меняет текст плавно и показывает секунды.
+    Возвращает функцию «стоп». Перерисовывает только два маленьких элемента, не всю страницу. */
+function waitTicker(textEl, secEl, texts) {
+  const t0 = Date.now();
+  let shown = "";
+  const tick = () => {
+    const sec = (Date.now() - t0) / 1000;
+    const text = texts.filter(([from]) => sec >= from).pop()[1];
+    if (text !== shown) {
+      shown = text;
+      textEl.style.opacity = 0;
+      setTimeout(() => { textEl.textContent = text; textEl.style.opacity = 1; }, 150);
+    }
+    if (secEl) secEl.textContent = sec >= 2 ? `${Math.floor(sec)} с` : "";
+  };
+  tick();
+  const timer = setInterval(tick, 250);
+  return () => clearInterval(timer);
+}
+const REPLACE_TEXTS = [
+  [0, "придумываю другой вопрос…"],
+  [3, "меняю вид вопроса, тема та же…"],
+  [7, "проверяю, что ответ сходится с пояснением…"],
+  [12, "ИИ на бесплатном тарифе думает дольше — ещё немного…"],
+  [22, "не понравился первый вариант — делаю ещё один…"],
+  [40, "долго… если не выйдет, вопрос останется прежним"],
+];
 function applyPalette(p) {
   document.documentElement.setAttribute("data-palette", p);
   $('meta[name="theme-color"]').setAttribute("content", PALETTE_BG[p] || "#ffffff");
@@ -374,8 +402,8 @@ async function pageRetry(attemptId) {
 /** «Пройти тему ещё раз»: новый квиз (старый не трогаем) → вопросы со статусами → прохождение. */
 async function runRetry(r, opts) {
   setTitle("Делаю квиз");
-  view.innerHTML = `<h1>${esc(r.title)}: ещё раз</h1><div class="panel"><div class="row"><div class="spinner" id="cr-spin"></div><b id="cr-now">готовлю…</b></div>
-    <ul class="status-lines" id="cr-lines"></ul></div><div id="cr-err"></div>
+  view.innerHTML = `<h1>${esc(r.title)}: ещё раз</h1><div class="panel"><div class="row"><div class="loader small" id="cr-spin" aria-hidden="true"><i></i><i></i><i></i></div><b id="cr-now">готовлю…</b></div>
+    <ul class="status-lines" id="cr-lines"></ul><div class="cr-tip"><span id="cr-tip"></span> <span id="cr-sec" class="muted small"></span></div></div><div id="cr-err"></div>
     <p class="muted small">Старый квиз и его итог остаются как были. Обычно это 20–90 секунд.</p>`;
   const lines = $("#cr-lines");
   const step = (text) => {
@@ -402,8 +430,8 @@ async function runRetry(r, opts) {
 /** Создание квиза со статусами: загрузка файлов → чтение → вопросы → проверка. */
 async function runCreation(body, files) {
   setTitle("Делаю квиз");
-  view.innerHTML = `<h1>${esc(body.topic)}</h1><div class="panel"><div class="row"><div class="spinner" id="cr-spin"></div><b id="cr-now">загружаю файлы…</b></div>
-    <ul class="status-lines" id="cr-lines"></ul><div id="cr-warn"></div></div><div id="cr-err"></div>
+  view.innerHTML = `<h1>${esc(body.topic)}</h1><div class="panel"><div class="row"><div class="loader small" id="cr-spin" aria-hidden="true"><i></i><i></i><i></i></div><b id="cr-now">загружаю файлы…</b></div>
+    <ul class="status-lines" id="cr-lines"></ul><div class="cr-tip"><span id="cr-tip"></span> <span id="cr-sec" class="muted small"></span></div><div id="cr-warn"></div></div><div id="cr-err"></div>
     <p class="muted small">Не закрывай приложение, пока квиз делается: обычно это 20–90 секунд.</p>`;
   const lines = $("#cr-lines");
   const step = (text) => {
@@ -445,8 +473,23 @@ async function runCreation(body, files) {
 }
 
 /** Шаг «вопросы от ИИ»: долгий запрос + опрос статуса раз в 1,5 с (меняется только строка статуса). */
+const GENERATE_TIPS = [
+  [0, "ИИ читает материал…"],
+  [5, "делит текст на темы и подтемы…"],
+  [12, "придумывает вопросы по плану уровня…"],
+  [22, "пишет пояснения: почему верно, где ловушка…"],
+  [35, "программа проверяет цитаты и ответы…"],
+  [50, "ИИ на бесплатном тарифе работает не спеша — ещё немного…"],
+  [80, "большой материал — это может занять ещё минуту…"],
+];
+
 async function generateWithStatus(quizId, step, fail) {
   step("делаю вопросы…");
+  const tipEl = $("#cr-tip");
+  const stopTips = tipEl ? waitTicker(tipEl, $("#cr-sec"), GENERATE_TIPS) : () => {};
+  onLeave(stopTips);
+  const fail0 = fail;
+  fail = (...a) => { stopTips(); if ($("#cr-tip")) { $("#cr-tip").textContent = ""; $("#cr-sec").textContent = ""; } fail0(...a); };
   let done = false;
   let last = "делаю вопросы…";
   const poll = async () => {
@@ -463,7 +506,7 @@ async function generateWithStatus(quizId, step, fail) {
   poll();
   try {
     const res = await api(`/api/quizzes/${quizId}/generate`, { method: "POST" });
-    done = true;
+    done = true; stopTips();
     if (res.warnings && res.warnings.length) toast(res.warnings.join(" "), 6000);
     step("готово!");
     go(`/play/${quizId}`, true);
@@ -488,8 +531,8 @@ function retryGenerate(quizId) { go(`/progress/${quizId}`); }
 
 async function pageProgress(quizId) {
   setTitle("Делаю квиз");
-  view.innerHTML = `<h1>Квиз</h1><div class="panel"><div class="row"><div class="spinner" id="cr-spin"></div><b id="cr-now">…</b></div>
-    <ul class="status-lines" id="cr-lines"></ul></div><div id="cr-err"></div>`;
+  view.innerHTML = `<h1>Квиз</h1><div class="panel"><div class="row"><div class="loader small" id="cr-spin" aria-hidden="true"><i></i><i></i><i></i></div><b id="cr-now">…</b></div>
+    <ul class="status-lines" id="cr-lines"></ul><div class="cr-tip"><span id="cr-tip"></span> <span id="cr-sec" class="muted small"></span></div></div><div id="cr-err"></div>`;
   const lines = $("#cr-lines");
   const step = (text) => {
     $$("li.now", lines).forEach((li) => { li.classList.remove("now"); li.classList.add("done"); });
@@ -551,6 +594,7 @@ async function pagePlay(quizId) {
     tick(); st.timer = setInterval(tick, 500);
   };
 
+  /** animate: true — новая карточка въезжает сбоку; "flip" — старая переворачивается и показывает новую (замена). */
   const showCard = (animate = true) => {
     const q = at.questions[st.idx];
     st.answered = false; st.cardStart = Date.now();
@@ -558,10 +602,10 @@ async function pagePlay(quizId) {
     const stage = $("#stage");
     const old = $(".card", stage);
     const card = document.createElement("div");
-    card.className = "card" + (animate ? " enter" : "");
+    card.className = "card" + (animate === "flip" ? " flip-in" : animate ? " enter" : "");
     card.innerHTML = cardHTML(q, at);
     const put = () => { stage.innerHTML = ""; stage.appendChild(card); bindCard(card, q); startTimer(q); };
-    if (old && animate) { old.classList.add("leave"); setTimeout(put, 200); } else put();
+    if (old && animate) { old.classList.add(animate === "flip" ? "flip-out" : "leave"); setTimeout(put, animate === "flip" ? 260 : 200); } else put();
   };
 
   let current = { getResponse: () => ({}) };
@@ -579,15 +623,25 @@ async function pagePlay(quizId) {
     if (st.busy || st.answered) return;
     st.busy = true; btn.disabled = true; btn.textContent = "…";
     clearInterval(st.timer);
-    let msg = null;
+    // Пока ИИ думает: карточка затуманивается, сверху прыгают карточки, текст говорит, что сейчас происходит.
+    const card = $("#stage .card");
+    card.classList.add("replacing");
+    const veil = document.createElement("div");
+    veil.className = "replace-veil"; veil.setAttribute("role", "status"); veil.setAttribute("aria-live", "polite");
+    veil.innerHTML = `<div class="loader small" aria-hidden="true"><i></i><i></i><i></i></div><div class="rv-text"></div><div class="rv-sec muted small"></div>`;
+    card.appendChild(veil);
+    const stopTicker = waitTicker($(".rv-text", veil), $(".rv-sec", veil), REPLACE_TEXTS);
+    onLeave(stopTicker);
+    let msg = null, changed = false;
     try {
       const r = await api(`/api/questions/${q.id}/replace`, { method: "POST" });
-      if (r.changed) { at.questions[st.idx] = { ...r.question, seconds: r.question.qtype === "open" ? at.level.timer_open_sec : at.level.timer_sec }; toast(r.message, 4000); }
+      if (r.changed) { changed = true; at.questions[st.idx] = { ...r.question, seconds: r.question.qtype === "open" ? at.level.timer_open_sec : at.level.timer_sec }; toast(r.message, 4000); }
       else { at.questions[st.idx].replace_count = r.question.replace_count; msg = r.message; }
     } catch (e) {
       msg = `Замена не вышла: ${e.message}`;
-    } finally { st.busy = false; }
-    showCard(false);
+    } finally { st.busy = false; stopTicker(); }
+    if (!document.body.contains(card)) return;  // ушли со страницы, пока ИИ думал
+    showCard(changed ? "flip" : false);
     if (msg) { const box = $("#stage .card-msg"); if (box) errorBox(box, msg, null, "Вопрос не заменён"); }
   };
 

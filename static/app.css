@@ -337,3 +337,23 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent-2); 
 .card-msg:empty { display: none; }
 .note-pre { white-space: pre-line; }
 div.field { margin: 14px 0; }
+
+/* Замена вопроса: карточка затуманивается и «дышит», сверху загрузчик; потом переворот к новой. */
+.card.replacing > :not(.replace-veil) { filter: blur(2px); opacity: .35; transition: filter .3s ease, opacity .3s ease; }
+.card.replacing { animation: cardBreath 1.8s ease-in-out infinite; pointer-events: none; }
+.replace-veil { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 12px; padding: 20px; text-align: center; border-radius: inherit; animation: veilIn .3s ease both; }
+.replace-veil .rv-text { font-weight: 650; min-height: 1.5em; transition: opacity .15s ease; }
+.replace-veil .rv-sec { min-height: 1.2em; font-variant-numeric: tabular-nums; }
+.card.flip-out { animation: flipOut .26s ease-in both; }
+.card.flip-in { animation: flipIn .34s ease-out both; }
+@keyframes cardBreath { 0%, 100% { transform: scale(1); } 50% { transform: scale(.985); } }
+@keyframes veilIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes flipOut { from { transform: perspective(900px) rotateY(0); opacity: 1; } to { transform: perspective(900px) rotateY(90deg); opacity: .6; } }
+@keyframes flipIn { from { transform: perspective(900px) rotateY(-90deg); opacity: .6; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .card.replacing, .card.flip-out, .card.flip-in, .replace-veil { animation: none; }
+}
+.cr-tip { min-height: 1.5em; color: var(--muted); font-size: 15px; }
+#cr-tip { transition: opacity .15s ease; }
+#cr-sec { font-variant-numeric: tabular-nums; }
