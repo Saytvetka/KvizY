@@ -60,10 +60,20 @@ def m003_review(engine):
     add_column(engine, "attempts", "review", "Utf8", "TEXT")
 
 
+def m004_explain_retry(engine):
+    """Пояснение по частям и «не проверено» у вопроса; цепочка «Пройти тему ещё раз» у квиза."""
+    add_column(engine, "questions", "explain", "Utf8", "TEXT")
+    add_column(engine, "questions", "verified", "Bool", "BOOLEAN")
+    add_column(engine, "quizzes", "parent_id", "Utf8", "VARCHAR")
+    add_column(engine, "quizzes", "root_id", "Utf8", "VARCHAR")
+    add_column(engine, "quizzes", "from_attempt_id", "Utf8", "VARCHAR")
+
+
 MIGRATIONS = [
     ("001_init", m001_init),
     ("002_users", m002_users),
     ("003_review", m003_review),
+    ("004_explain_retry", m004_explain_retry),
 ]
 
 

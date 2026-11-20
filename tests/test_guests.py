@@ -61,7 +61,7 @@ def test_guest_isolation_and_limits(client):
     r = m.post("/api/quizzes", json={"subject": "Химия", "topic": "Ещё", "count": 3, "text": "x " * 50 + "Кислоты меняют цвет лакмуса на красный цвет всегда."})
     q2 = r.json()["quiz_id"]
     r = m.post(f"/api/quizzes/{q2}/generate")
-    assert r.status_code == 502 and "Лимит" in r.json()["detail"]
+    assert r.status_code == 503 and "Лимит" in r.json()["detail"]
     # у владельца лимита нет
     assert client.post("/api/settings/ai/check", json={"provider": "mock"}).json()["ok"] is True
     people = client.get("/api/usage").json()["by_user"]

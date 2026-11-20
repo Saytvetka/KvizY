@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import threading
 from contextlib import contextmanager
 
@@ -25,7 +26,8 @@ from app.db import (OWNER_ID, Answer, Attempt, Question, Quiz, QuizText, Session
 from app.quiz import mockai, prompts
 from app.quiz.material import (MaterialError, QuoteIndex, allocate, estimate_tokens, nice_subject, norm_for_match,
                                norm_subject, split_text)
-from app.quiz.questions import TYPES, finalize, is_duplicate, normalize, problems, public, snapshot, type_plan
+from app.quiz.questions import (CONTRADICTION, TYPES, finalize, hint_mode, is_duplicate, key_of, level, normalize,
+                                problems, public, snapshot, type_plan)
 
 TEXT_PART = 200_000          # символов в одной строке quiz_texts (YDB любит небольшие ячейки)
 TOKENS_PER_QUESTION = 450    # сколько токенов ответа закладываем на один вопрос
@@ -224,12 +226,42 @@ def _replace_round(quiz: Quiz, slots: list[dict], material: str, p, hints: bool,
     return out
 
 
+def plan_minus(plan: dict[str, int], taken: list[str]) -> dict[str, int]:
+    """План уровня минус виды, которые уже заняты (вопросы-ошибки из прошлой попытки)."""
+    plan = dict(plan)
+    for t in taken:
+        if plan.get(t, 0) <= 0:
+            t = max(plan, key=lambda x: plan[x])
+        plan[t] -= 1
+    return {t: c for t, c in plan.items() if c > 0}
+
+
+def split_plan(plan: dict[str, int], counts: list[int]) -> list[dict[str, int]]:
+    """Общий план видов → план на каждый запрос (виды равномерно перемешаны между запросами)."""
+    order = sorted(((i + 0.5) / c, t) for t, c in plan.items() for i in range(c))
+    types = [t for _, t in order]
+    out, pos = [], 0
+    for k in counts:
+        part: dict[str, int] = {}
+        for t in types[pos:pos + k]:
+            part[t] = part.get(t, 0) + 1
+        out.append(part)
+        pos += k
+    return out
+
+
 def make_questions(quiz: Quiz, material: str, n: int, difficulty: str, hints: bool, subject: str,
                    instruction: str = "", avoid: list[str] | None = None, status_cb=None,
-                   known_topics: list[str] | None = None) -> tuple[list[dict], list[dict], list[str]]:
-    """Сделать n проверенных вопросов по материалу. → (темы, вопросы, предупреждения)."""
+                   known_topics: list[str] | None = None, similarity: float = 0.8,
+                   retry: bool = False, taken: list[str] | None = None) -> tuple[list[dict], list[dict], list[str]]:
+    """Сделать n проверенных вопросов по материалу. → (темы, вопросы, предупреждения).
+    Виды вопросов — строго по плану уровня (лишние виды заменяются). Вопрос, у которого ответ
+    не сходится с пояснением, перегенерируется один раз; не сошлось снова — «не проверено»."""
     p = ai.get_provider()
     jobs = plan_requests(material, n, p)
+    plan_all = plan_minus(type_plan(n + len(taken or []), difficulty), taken or [])
+    plans = split_plan(plan_all, [c for _, c in jobs])
+    mode = hint_mode(difficulty, hints)
     quotes = QuoteIndex(material)
     topics: list[dict] = []
     topic_names: dict[str, str] = {}
@@ -238,6 +270,10 @@ def make_questions(quiz: Quiz, material: str, n: int, difficulty: str, hints: bo
     warnings: list[str] = []
     avoid = list(avoid or [])
     say = status_cb or (lambda *_: None)
+
+    def dup(q: dict) -> bool:
+        k = key_of(q)
+        return is_duplicate(k, avoid, similarity) or is_duplicate(k, [key_of(g) for g in good])
 
     def add_topics(items):
         for t in items or []:
@@ -259,21 +295,21 @@ def make_questions(quiz: Quiz, material: str, n: int, difficulty: str, hints: bo
                 if sname and sname.lower() not in [x.lower() for x in entry["subtopics"]]:
                     entry["subtopics"].append(sname)
 
-    for k, (chunk, cnt) in enumerate(jobs, start=1):
+    for k, ((chunk, cnt), plan) in enumerate(zip(jobs, plans), start=1):
         say("делаю вопросы…" if len(jobs) == 1 else f"делаю вопросы… (часть {k} из {len(jobs)})")
-        plan = type_plan(cnt)
-        prev = avoid + [q["text"] for q in good]
+        prev = avoid + [key_of(q) for q in good]
         data = ai.ask_json(
             "subject_quiz" if quiz.kind == "subject" else "quiz",
             prompts.quiz_prompt(title=quiz.topic, subject=subject, n=cnt, difficulty=difficulty, plan=plan,
-                                hints=hints, material=chunk, instruction=instruction,
+                                hints=mode, material=chunk, instruction=instruction,
                                 part=(k, len(jobs)) if len(jobs) > 1 else None,
                                 known_topics=[t["name"] for t in topics] or known_topics,
                                 avoid=prev if (prev and (len(jobs) > 1 or avoid)) else None,
-                                seed=hash((quiz.id, k)) & 0xFFFF),
+                                seed=hash((quiz.id, k)) & 0xFFFF, retry=retry),
             expect=("questions",), quiz_id=quiz.id, quiz_title=quiz.topic, user_id=quiz.user_id,
             max_tokens=min(p.max_output, 600 + TOKENS_PER_QUESTION * cnt),
-            mock=lambda chunk=chunk, cnt=cnt, plan=plan, k=k, prev=prev: mockai.quiz(chunk, cnt, plan, offset=k * 31, avoid=prev))
+            mock=lambda chunk=chunk, cnt=cnt, plan=plan, k=k, prev=prev: mockai.quiz(
+                chunk, cnt, plan, offset=k * 31, avoid=prev, outside=round(cnt * level(difficulty)["outside_share"])))
         if isinstance(data, list):
             data = {"questions": data}
         add_topics(data.get("topics") or data.get("темы"))
@@ -281,63 +317,90 @@ def make_questions(quiz: Quiz, material: str, n: int, difficulty: str, hints: bo
         for raw in raw_qs[:cnt + 3]:
             q = normalize(raw, {"difficulty": difficulty})
             q["difficulty"] = difficulty
-            q["_chunk_plan"] = plan
             probs = problems(q, quotes)
-            dup = is_duplicate(q.get("text", ""), avoid + [g["text"] for g in good])
-            if not probs and not dup:
+            if q["qtype"] in TYPES and q["qtype"] not in plan_all:
+                probs.append("вид не для этого уровня")
+            is_dup = dup(q)
+            if not probs and not is_dup:
                 good.append(q)
             else:
-                q["_problems"] = probs + (["дубль"] if dup else [])
+                q["_problems"] = probs + (["дубль"] if is_dup else [])
                 bad.append(q)
 
     say("проверяю…")
-    if len(good) > n:
-        good = good[:n]
-    # Слоты на замену: плохие вопросы + недостающие до n.
+    # Виды — строго по плану уровня: лишние вопросы вида откладываем (возьмём, если замена не выйдет).
+    have: dict[str, int] = {}
+    kept, extra = [], []
+    for q in good:
+        if have.get(q["qtype"], 0) < plan_all.get(q["qtype"], 0):
+            have[q["qtype"]] = have.get(q["qtype"], 0) + 1
+            kept.append(q)
+        else:
+            extra.append(q)
+    good = kept
+    missing_types = [t for t, c in plan_all.items() for _ in range(c - have.get(t, 0))]
+    # Слоты на замену: плохие вопросы + недостающие до плана. Вид слота — тот, которого не хватает.
     slots: list[dict] = []
-    need = n - len(good)
-    plan_all = type_plan(n)
-    have = {t: sum(1 for g in good if g["qtype"] == t) for t in TYPES}
-    for q in bad[:need]:
-        t = q["qtype"] if q["qtype"] in TYPES else next((t for t, c in plan_all.items() if have.get(t, 0) < c), "single")
-        have[t] = have.get(t, 0) + 1
-        slots.append({"slot": f"s{len(slots) + 1}", "type": t, "topic": q.get("topic", ""), "subtopic": q.get("subtopic", ""),
-                      "difficulty": difficulty, "flag": q.get("flag", ""), "near_quote": q.get("quote", ""),
-                      "avoid": [q.get("text", "")] + [g["text"] for g in good if g.get("topic") == q.get("topic")][:6]})
     names = [t["name"] for t in topics] or ["Основное"]
-    while len(slots) < need:
-        t = next((t for t, c in plan_all.items() if have.get(t, 0) < c), "single")
-        have[t] = have.get(t, 0) + 1
-        top = names[len(slots) % len(names)]
-        slots.append({"slot": f"s{len(slots) + 1}", "type": t, "topic": top, "subtopic": "", "difficulty": difficulty,
-                      "flag": "", "near_quote": "", "avoid": [g["text"] for g in good][:10]})
+    for t in missing_types:
+        src = next((b for b in bad if b["qtype"] == t and not b.get("_slot")), None) or \
+            next((b for b in bad if not b.get("_slot")), None)
+        if src is not None:
+            src["_slot"] = True
+        top = (src or {}).get("topic") or names[len(slots) % len(names)]
+        slots.append({"slot": f"s{len(slots) + 1}", "type": t, "topic": top,
+                      "subtopic": (src or {}).get("subtopic", ""), "difficulty": difficulty,
+                      "flag": (src or {}).get("flag", ""),
+                      "near_quote": (src or {}).get("quote", ""),
+                      "avoid": ([src.get("text", "")] if src else []) + [g["text"] for g in good][:10] + avoid[:15]})
     quote_only: list[dict] = []
+    unverified: list[dict] = []
     if slots:
         say("заменяю неудачные вопросы…")
-        repl = _replace_round(quiz, slots, material, p, hints, subject, status_cb=None)
+        repl = _replace_round(quiz, slots, material, p, mode, subject, status_cb=None)
         for s_ in slots:
             q = repl.get(s_["slot"])
             if not q:
                 continue
             q["difficulty"] = difficulty
             probs = problems(q, quotes)
-            dup = is_duplicate(q.get("text", ""), avoid + [g["text"] for g in good])
-            if not probs and not dup:
+            if q.get("_wrong_type"):
+                probs.append("вид не тот")
+            if dup(q):
+                continue
+            if not probs:
                 good.append(q)
-            elif probs == ["quote"] and not dup:
+            elif probs == ["quote"]:
                 quote_only.append(q)
-        # Не хватает — берём вопросы, у которых всё хорошо, кроме цитаты (цитату не показываем).
-        for q in bad + quote_only:
-            if len(good) >= n:
-                break
-            if q.get("_problems", problems(q, quotes)) in (["quote"],) or (q in quote_only):
-                if not is_duplicate(q["text"], [g["text"] for g in good]):
-                    q["quote"] = ""
-                    q["_no_quote"] = True
-                    good.append(q)
+            elif probs == [CONTRADICTION]:
+                unverified.append(q)  # второй раз не сошлось — «не проверено»
+    # Не хватает — запасные варианты, по очереди: лишние виды → без цитаты → «не проверено».
+    for q in extra:
+        if len(good) >= n:
+            break
+        if not dup(q):
+            good.append(q)
+    for q in quote_only + [b for b in bad if b.get("_problems") == ["quote"]]:
+        if len(good) >= n:
+            break
+        if not dup(q):
+            q["quote"] = ""
+            q["_no_quote"] = True
+            good.append(q)
+    for q in unverified + [b for b in bad if b.get("_problems") == [CONTRADICTION]]:
+        if len(good) >= n:
+            break
+        if not dup(q):
+            q["verified"] = False
+            good.append(q)
+    good = good[:n]
     no_quote = sum(1 for q in good if q.get("_no_quote"))
     if no_quote:
-        warnings.append(f"У {no_quote} вопр. ИИ не дал точную цитату из материала — проверь их в итоге.")
+        warnings.append(f"У {no_quote} вопр. ИИ не дал точную цитату из материала — цитату не показываю.")
+    n_unv = sum(1 for q in good if q.get("verified") is False)
+    if n_unv:
+        warnings.append(f"{n_unv} вопр. помечены «не проверено»: ответ ИИ дважды не сошёлся с пояснением. "
+                        "Их можно пройти, но в баллы они не идут.")
     if len(good) < n:
         warnings.append(f"Получилось {len(good)} вопросов из {n}: ИИ не смог сделать остальные без ошибок.")
     if not good:
@@ -348,8 +411,8 @@ def make_questions(quiz: Quiz, material: str, n: int, difficulty: str, hints: bo
             q["topic"] = names[0]
         add_topics([{"name": q["topic"], "subtopics": [q["subtopic"]] if q.get("subtopic") else []}])
         q["topic"] = topic_names.get(q["topic"].lower(), q["topic"])
-        finalize(q, hints)
-    return topics, good[:n], warnings
+        finalize(q, mode, difficulty)
+    return topics, good, warnings
 
 
 def _save_questions(quiz_id: str, user_id: str, qs: list[dict], start: int = 0) -> None:
@@ -359,6 +422,7 @@ def _save_questions(quiz_id: str, user_id: str, qs: list[dict], start: int = 0) 
                            subtopic=q.get("subtopic") or "", qtype=q["qtype"], difficulty=q.get("difficulty"),
                            flag=q.get("flag") or "", text=q["text"], options=dumps(q.get("options")),
                            answer=dumps(q.get("answer")), explanation=q.get("explanation") or "",
+                           explain=dumps(q.get("explain") or {}), verified=q.get("verified", True) is not False,
                            quote=q.get("quote") or "", points=q.get("points", 1), hint=q.get("hint") or "",
                            replace_count=0, replace_history=dumps([]),
                            source_question_id=q.get("source_question_id")))
@@ -390,6 +454,8 @@ def generate(quiz_id: str) -> dict:
             warnings = loads(quiz.warnings, [])
             if quiz.kind == "subject":
                 topics, qs, w = _subject_questions(quiz, subj, params, n, difficulty, hints, say)
+            elif quiz.parent_id:
+                topics, qs, w = _retry_questions(quiz, subj, params, n, difficulty, hints, say)
             else:
                 material = load_text(quiz_id)
                 if not material:
@@ -481,26 +547,36 @@ def create_subject_quiz(subject_id: str, params: dict, user_id: str = OWNER_ID) 
     return qid
 
 
-def _subject_questions(quiz: Quiz, subj: Subject, params: dict, n: int, difficulty: str, hints: bool, say):
-    say("беру старые вопросы…")
-    old_ids = params.get("old_ids") or []
-    with SessionLocal() as s:
-        olds = list(s.scalars(sa.select(Question).where(Question.id.in_(old_ids))).all()) if old_ids else []
-    olds.sort(key=lambda q: old_ids.index(q.id))
-    qs: list[dict] = []
-    for o in olds:
-        qs.append({"topic": o.topic, "subtopic": o.subtopic, "qtype": o.qtype, "difficulty": o.difficulty,
-                   "flag": o.flag, "text": o.text, "options": loads(o.options), "answer": loads(o.answer),
-                   "explanation": o.explanation, "quote": o.quote, "points": o.points,
-                   "hint": o.hint if hints else "", "source_question_id": o.id})
+def _copy_question(o: Question, difficulty: str, hints: bool) -> dict:
+    """Старый вопрос в новый квиз: та же суть, баллы и подсказки — по уровню нового квиза."""
+    q = {"topic": o.topic, "subtopic": o.subtopic, "qtype": o.qtype, "difficulty": difficulty,
+         "flag": o.flag or "", "text": o.text, "options": loads(o.options), "answer": loads(o.answer),
+         "explanation": o.explanation, "explain": loads(o.explain, {}) or {}, "quote": o.quote,
+         "hint": o.hint or "", "source_question_id": o.source_question_id or o.id,
+         "verified": o.verified is not False}
+    return finalize(q, hint_mode(difficulty, hints), difficulty)
+
+
+def _topics_of(qs) -> list[dict]:
     topics: list[dict] = []
-    for o in olds:
+    for o in qs:
         t = next((x for x in topics if x["name"] == o.topic), None)
         if t is None:
             t = {"name": o.topic, "subtopics": []}
             topics.append(t)
         if o.subtopic and o.subtopic not in t["subtopics"]:
             t["subtopics"].append(o.subtopic)
+    return topics
+
+
+def _subject_questions(quiz: Quiz, subj: Subject, params: dict, n: int, difficulty: str, hints: bool, say):
+    say("беру старые вопросы…")
+    old_ids = params.get("old_ids") or []
+    with SessionLocal() as s:
+        olds = list(s.scalars(sa.select(Question).where(Question.id.in_(old_ids))).all()) if old_ids else []
+    olds.sort(key=lambda q: old_ids.index(q.id))
+    qs = [_copy_question(o, difficulty, hints) for o in olds]
+    topics = _topics_of(olds)
     warnings: list[str] = []
     n_new = n - len(qs)
     if n_new > 0:
@@ -518,7 +594,7 @@ def _subject_questions(quiz: Quiz, subj: Subject, params: dict, n: int, difficul
             start = random.randrange(len(chunks))
             step = len(chunks) / k
             material = "\n\n".join(chunks[int(start + i * step) % len(chunks)] for i in range(k))
-        pool_texts = [q.text for q in _pool(subj.id)]
+        pool_texts = [key_of(q) for q in _pool(subj.id)]
         new_topics, new_qs, warnings = make_questions(
             quiz, material, n_new, difficulty, hints, subj.name, avoid=pool_texts, status_cb=say,
             known_topics=[t["name"] for t in topics])
@@ -530,6 +606,104 @@ def _subject_questions(quiz: Quiz, subj: Subject, params: dict, n: int, difficul
                 ex["subtopics"] += [s for s in t["subtopics"] if s not in ex["subtopics"]]
         qs += new_qs
     random.shuffle(qs)
+    return topics, qs, warnings
+
+
+# --- «Пройти тему ещё раз» -------------------------------------------------------------
+
+def family(quiz: Quiz) -> list[Quiz]:
+    """Все квизы цепочки попыток темы (первый и все «ещё раз» от него), по времени."""
+    root = quiz.root_id or quiz.id
+    with SessionLocal() as s:
+        rows = s.scalars(sa.select(Quiz).where(sa.or_(Quiz.id == root, Quiz.root_id == root))).all()
+    return sorted(rows, key=lambda q: q.created_at or now())
+
+
+def mistake_ids(attempt_id: str) -> list[str]:
+    """Вопросы попытки, где была ошибка (частично верно и «время вышло» — тоже ошибка).
+    Вопросы «не проверено» и заменённые после ответа не берём."""
+    with SessionLocal() as s:
+        answers = s.scalars(sa.select(Answer).where(Answer.attempt_id == attempt_id)
+                            .order_by(Answer.created_at)).all()
+        qs = {q.id: q for q in s.scalars(sa.select(Question).where(
+            Question.id.in_([a.question_id for a in answers] or ["-"]))).all()}
+    out = []
+    for a in answers:
+        q = qs.get(a.question_id)
+        snap = loads(a.snapshot, {})
+        if a.correct or q is None or q.verified is False or snap.get("verified") is False:
+            continue
+        if snap.get("text") and snap["text"] != q.text:
+            continue
+        out.append(q.id)
+    return out
+
+
+def create_retry(attempt_id: str, opts: dict, user_id: str) -> dict:
+    """Новый квиз по той же теме: тот же текст и диапазон, новые вопросы; часть — из ошибок попытки.
+    Старый квиз не меняется. → {"quiz_id", "mistakes"}"""
+    with SessionLocal() as s:
+        att = s.get(Attempt, attempt_id)
+        if att is None:
+            raise QuizError("Попытка не найдена")
+        old = s.get(Quiz, att.quiz_id)
+    if old is None:
+        raise QuizError("Квиз этой попытки удалён — пройти тему ещё раз не из чего.")
+    if old.kind != "normal":
+        raise QuizError("Это квиз по предмету: новый такой квиз собирается на странице предмета.")
+    text = load_text(old.id)
+    if not text:
+        raise QuizError("Текст материала этого квиза не найден — создай квиз заново.")
+    p_old = loads(old.params, {})
+    n = int(opts.get("count") or p_old.get("count", 10))
+    use = opts.get("use_mistakes", True)
+    mist = mistake_ids(attempt_id) if use else []
+    mist = mist[:round(n * config.RETRY_MISTAKES_SHARE)]
+    params = {"count": n, "difficulty": opts.get("difficulty") or p_old.get("difficulty", "medium"),
+              "timer": bool(opts.get("timer", p_old.get("timer"))), "hints": bool(opts.get("hints", p_old.get("hints"))),
+              "range_rest": p_old.get("range_rest", ""), "mistake_ids": mist}
+    qid = new_id()
+    with SessionLocal() as s:
+        s.add(Quiz(id=qid, user_id=user_id, subject_id=old.subject_id, topic=old.topic, kind="normal",
+                   params=dumps(params), source_range=old.source_range, range_note=old.range_note,
+                   sources=old.sources, chars=old.chars, status="new", status_text="жду запуска",
+                   warnings=dumps([]), parent_id=old.id, root_id=old.root_id or old.id, from_attempt_id=attempt_id))
+        s.commit()
+    save_text(qid, text, user_id)
+    return {"quiz_id": qid, "mistakes": len(mist)}
+
+
+def _retry_questions(quiz: Quiz, subj: Subject | None, params: dict, n: int, difficulty: str, hints: bool, say):
+    say("беру вопросы, где были ошибки…")
+    ids = params.get("mistake_ids") or []
+    with SessionLocal() as s:
+        olds = list(s.scalars(sa.select(Question).where(Question.id.in_(ids))).all()) if ids else []
+        fam_ids = [q.id for q in family(quiz) if q.id != quiz.id]
+        seen = list(s.scalars(sa.select(Question).where(Question.quiz_id.in_(fam_ids or ["-"]))).all())
+    olds.sort(key=lambda q: ids.index(q.id))
+    qs = [_copy_question(o, difficulty, hints) for o in olds][:n]
+    topics = _topics_of(olds)
+    # Что человек уже видел в этой теме: все вопросы цепочки и их прошлые варианты (до замены).
+    avoid = [key_of(q) for q in seen] + [key_of(h) for q in seen for h in loads(q.replace_history, [])]
+    warnings: list[str] = []
+    n_new = n - len(qs)
+    if n_new > 0:
+        material = load_text(quiz.id)
+        if not material:
+            raise QuizError("Текст материала не сохранился. Создай квиз заново.")
+        new_topics, new_qs, warnings = make_questions(
+            quiz, material, n_new, difficulty, hints, subj.name if subj else "",
+            instruction=params.get("range_rest", ""), avoid=[a for a in avoid if a], status_cb=say,
+            known_topics=[t["name"] for t in topics], similarity=config.RETRY_SIMILARITY, retry=True,
+            taken=[q["qtype"] for q in qs])
+        for t in new_topics:
+            ex = next((x for x in topics if x["name"].lower() == t["name"].lower()), None)
+            if ex is None:
+                topics.append(t)
+            else:
+                ex["subtopics"] += [x for x in t["subtopics"] if x not in ex["subtopics"]]
+        qs += new_qs
+    random.Random(quiz.id).shuffle(qs)
     return topics, qs, warnings
 
 
@@ -555,7 +729,8 @@ def replace_question(question_id: str) -> dict:
     if not material:
         raise QuizError("Текст материала не найден — заменить вопрос не из чего.")
     params = loads(quiz.params, {})
-    hints = bool(params.get("hints"))
+    difficulty = params.get("difficulty") or q.difficulty or "medium"
+    mode = hint_mode(difficulty, bool(params.get("hints")))
     p = ai.get_provider()
     quotes = QuoteIndex(material)
     avoid = [h.get("text", "") for h in history] + [q.text]
@@ -565,7 +740,7 @@ def replace_question(question_id: str) -> dict:
         slot = {"slot": "s1", "type": "any", "not_type": q.qtype, "topic": q.topic, "subtopic": q.subtopic,
                 "difficulty": q.difficulty, "flag": q.flag or "", "near_quote": q.quote or "",
                 "avoid": avoid + others[:20]}
-        cand = _replace_round(quiz, [slot], material, p, hints, subj.name if subj else "").get("s1")
+        cand = _replace_round(quiz, [slot], material, p, mode, subj.name if subj else "").get("s1")
         if not cand:
             reason = "ИИ не прислал новый вопрос"
             continue
@@ -582,23 +757,25 @@ def replace_question(question_id: str) -> dict:
             reason = "новый вопрос не прошёл проверку (" + ", ".join(
                 "цитаты нет в материале" if x == "quote" else x for x in probs) + ")"
             continue
+        if cand.get("qtype") not in level(difficulty)["types"]:
+            reason = "ИИ прислал вид вопроса, которого нет на этом уровне"
+            continue
         got = cand
         break
     if got is None:
         return {"changed": False, "message": f"{reason[:1].upper()}{reason[1:]}. Замена не засчитана — попробуй ещё раз.",
                 "question": public(q)}
-    got["difficulty"] = q.difficulty
-    finalize(got, hints)
+    got["difficulty"] = difficulty
+    finalize(got, mode, difficulty)
     with SessionLocal() as s:
         q = s.get(Question, question_id)
         history.append(snapshot(q))
         q.qtype = got["qtype"]
         q.text, q.options, q.answer = got["text"], dumps(got["options"]), dumps(got["answer"])
         q.explanation, q.quote, q.hint = got.get("explanation", ""), got.get("quote", ""), got.get("hint", "")
+        q.explain, q.verified = dumps(got.get("explain") or {}), True
         q.subtopic = got.get("subtopic") or q.subtopic
         q.flag = got.get("flag") or ""
-        if not hints or q.flag not in ("outside", "logic"):
-            q.hint = ""
         q.points = got["points"]
         q.replace_count = (q.replace_count or 0) + 1
         q.replace_history = dumps(history)
@@ -617,8 +794,8 @@ def check_open(quiz: Quiz, question: Question, text: str) -> tuple[float, str]:
     data = ai.ask_json(
         "check_open", prompts.check_open_prompt(question=question.text, reference=ans.get("reference", ""),
                                                 key_points=ans.get("key_points", []), answer=text[:3000]),
-        expect=("score",), quiz_id=quiz.id, quiz_title=quiz.topic, user_id=quiz.user_id, max_tokens=300,
-        mock=lambda: mockai.check_open(ans.get("reference", ""), text))
+        expect=("score",), quiz_id=quiz.id, quiz_title=quiz.topic, user_id=quiz.user_id, max_tokens=400,
+        mock=lambda: mockai.check_open(ans.get("reference", ""), text, ans.get("key_points", [])))
     raw = data.get("score", data.get("баллы", data.get("оценка"))) if isinstance(data, dict) else None
     verdict = str(data.get("verdict", "")).lower() if isinstance(data, dict) else ""
     score = ai.to_number(raw, -1)
@@ -630,7 +807,33 @@ def check_open(quiz: Quiz, question: Question, text: str) -> tuple[float, str]:
         score = score / 100 if score > 2 else score / 2
     score = 1.0 if score >= 0.75 else 0.5 if score >= 0.25 else 0.0
     comment = str(data.get("comment") or data.get("explanation") or data.get("комментарий") or "").strip()
-    return score, comment
+    miss = data.get("missing", data.get("не_хватает", []))
+    if isinstance(miss, str):
+        miss = [x for x in re.split(r";|\n", miss) if x.strip()]
+    miss = [str(x).strip() for x in miss or [] if str(x).strip()]
+    if score < 1 and not miss:
+        # ИИ не сказал, чего не хватает — считаем кодом: главные мысли образца, слов которых нет в ответе.
+        miss = missing_points(ans, text)
+    return score, open_note(comment, miss if score < 1 else [])
+
+
+def missing_points(ans: dict, text: str) -> list[str]:
+    """Главные мысли образца, которых нет в ответе (по совпадению слов; без ИИ)."""
+    words = {w for w in norm_for_match(text).split() if len(w) > 3}
+    points = ans.get("key_points") or [ans.get("reference", "")]
+    out = []
+    for kp in points:
+        kw = {w for w in norm_for_match(kp).split() if len(w) > 3}
+        if kw and len(kw & {w2 for w in words for w2 in kw if w[:5] == w2[:5]}) / len(kw) < 0.5:
+            out.append(str(kp).strip())
+    return out
+
+
+def open_note(comment: str, missing: list[str]) -> str:
+    parts = [comment.strip()] if comment.strip() else []
+    if missing:
+        parts.append("Не хватает: " + "; ".join(missing[:4]))
+    return "\n".join(parts)
 
 
 # --- Разбор ошибок -------------------------------------------------------------------

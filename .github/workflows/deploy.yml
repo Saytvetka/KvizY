@@ -1,4 +1,5 @@
-# При каждом пуше в main: тесты → сборка образа → Yandex Container Registry → новая ревизия контейнера.
+# При каждом пуше в main: тесты → сборка образа → тесты ВНУТРИ образа → /api/health образа →
+# Yandex Container Registry → новая ревизия контейнера. Упал любой шаг — выкатки нет.
 # Нужные секреты (Settings → Secrets and variables → Actions) описаны в docs/yandex_cloud.md.
 name: deploy
 
@@ -80,11 +81,32 @@ jobs:
           yc config set folder-id "$FOLDER_ID"
           echo "$KEY" | docker login --username json_key --password-stdin cr.yandex
 
-      - name: Собрать и загрузить образ
+      - name: Собрать образ
+        if: steps.check.outputs.skip != '1'
+        run: docker build -t "$IMAGE" .
+
+      - name: Автотесты внутри собранного образа (пробный ИИ, без денег)
         if: steps.check.outputs.skip != '1'
         run: |
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+          docker run --rm -v "$PWD/tests:/srv/tests:ro" -v "$PWD/requirements-dev.txt:/srv/requirements-dev.txt:ro" \
+            "$IMAGE" sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider tests"
+
+      - name: Образ запускается и отвечает на /api/health
+        if: steps.check.outputs.skip != '1'
+        run: |
+          docker run -d --name smoke -p 8080:8080 -e KVIZY_PASSWORD=x -e SESSION_SECRET=x -e KEY_SECRET=x -e AI_PROVIDER=mock "$IMAGE"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            code=$(curl -s -o body.txt -w "%{http_code}" http://localhost:8080/api/health || true)
+            echo "Попытка $i: HTTP $code"; cat body.txt 2>/dev/null; echo
+            [ "$code" = "200" ] && { docker rm -f smoke >/dev/null; exit 0; }
+            sleep 2
+          done
+          docker logs smoke; docker rm -f smoke >/dev/null
+          echo "::error::Собранный образ не отвечает на /api/health"; exit 1
+
+      - name: Загрузить образ
+        if: steps.check.outputs.skip != '1'
+        run: docker push "$IMAGE"
 
       - name: Новая ревизия контейнера
         if: steps.check.outputs.skip != '1'

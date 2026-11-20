@@ -31,7 +31,26 @@ def _long_words(s: str) -> list[str]:
     return [w for w in re.findall(r"[А-Яа-яЁёA-Za-z]{5,}", s)]
 
 
-def _make(qtype: str, i: int, sents: list[str], topic: str, sub: str, avoid: list[str], words: list[str]) -> dict:
+def _explain(q: dict, s: str) -> dict:
+    """Пояснение пробного ИИ: правильный ответ словами + почему, ловушка, что запомнить."""
+    t = q["type"]
+    if t == "single":
+        at = q["options"][q["correct"]]
+    elif t == "multi":
+        at = "; ".join(q["options"][i] for i in q["correct"])
+    elif t == "tf":
+        at = "верно" if q["correct"] else "неверно"
+    elif t == "fill":
+        at = q["accepted"][0]
+    else:
+        at = ""
+    return {"answer_text": at, "why": f"В материале сказано: {s[:100]}.",
+            "trap": "Остальные варианты в этом месте материала не встречаются.",
+            "remember": " ".join(s.split()[:8]) + "…"}
+
+
+def _make(qtype: str, i: int, sents: list[str], topic: str, sub: str, avoid: list[str], words: list[str],
+          outside: bool = False) -> dict:
     n = len(sents)
     avoid_n = {norm_for_match(a) for a in avoid}
     variants = [(shift, kwi) for kwi in range(3) for shift in range(n)]
@@ -39,9 +58,9 @@ def _make(qtype: str, i: int, sents: list[str], topic: str, sub: str, avoid: lis
         s = sents[(i + shift) % n]
         kw = sorted(_long_words(s), key=len, reverse=True)
         key = kw[kwi % len(kw)] if kw else "материал"
-        q = {"type": qtype, "topic": topic, "subtopic": sub, "flag": "logic" if i % 4 == 3 else "",
-             "quote": s, "explanation": f"Так написано в материале: «{s[:120]}».",
-             "hint": "Вспомни, о чём говорится рядом с этим местом в материале." if i % 4 == 3 else ""}
+        q = {"type": qtype, "topic": topic, "subtopic": sub, "flag": "outside" if outside else "",
+             "quote": "" if outside else s,
+             "hint": "Вспомни, о чём говорится рядом с этим местом в материале."}
         others = [w for w in words if w.lower() != key.lower()]
         if qtype == "single":
             q["text"] = f"Какое слово пропущено: «{s.replace(key, '___', 1)}»?"
@@ -82,13 +101,15 @@ def _make(qtype: str, i: int, sents: list[str], topic: str, sub: str, avoid: lis
         elif qtype == "fill":
             q["text"] = s.replace(key, "___", 1)
             q["accepted"] = [key]
+        q["explain"] = _explain(q, s)
         from app.quiz.questions import is_duplicate
-        if norm_for_match(q.get("text", "")) not in avoid_n and not is_duplicate(q.get("text", ""), avoid):
+        if norm_for_match(q.get("text", "")) not in avoid_n and not is_duplicate(q.get("text", ""), avoid, 0.6):
             return q
     return q
 
 
-def quiz(material: str, n: int, plan: dict[str, int], offset: int = 0, avoid: list[str] | None = None) -> dict:
+def quiz(material: str, n: int, plan: dict[str, int], offset: int = 0, avoid: list[str] | None = None,
+         outside: int = 0) -> dict:
     sents = _sentences(material)
     heads = _headings(material)
     words = list(dict.fromkeys(w for s in sents for w in _long_words(s)))[:50]
@@ -99,7 +120,8 @@ def quiz(material: str, n: int, plan: dict[str, int], offset: int = 0, avoid: li
     qs = []
     for i, t in enumerate(types[:n]):
         top = topics[i % len(topics)]
-        qs.append(_make(t, i + offset, sents, top["name"], top["subtopics"][(i // len(topics)) % 2], avoid or [], words))
+        qs.append(_make(t, i + offset, sents, top["name"], top["subtopics"][(i // len(topics)) % 2], avoid or [], words,
+                        outside=i < outside))
     return {"topics": topics, "questions": qs}
 
 
@@ -107,14 +129,16 @@ def replace(material: str, slots: list[dict]) -> dict:
     sents = _sentences(material)
     words = list(dict.fromkeys(w for s in sents for w in _long_words(s)))[:50]
     out = []
+    made: list[str] = []   # не повторяться между слотами одного запроса
     for k, s in enumerate(slots):
-        avoid = s.get("avoid", [])
+        avoid = s.get("avoid", []) + made
         t = s["type"]
         if t == "any":
             t = next(x for x in ["single", "tf", "fill", "multi", "open"] if x != s.get("not_type"))
-        q = _make(t, 7 + k + len(avoid) * 3, sents, s.get("topic", ""), s.get("subtopic", ""), avoid, words)
+        q = _make(t, 7 + k + len(avoid) * 3, sents, s.get("topic", ""), s.get("subtopic", ""), avoid, words,
+                  outside=s.get("flag") == "outside")
         q["slot"] = s["slot"]
-        q["flag"] = s.get("flag", "")
+        made.append(q.get("text", ""))
         out.append(q)
     return {"questions": out}
 
@@ -129,9 +153,11 @@ def review(mistakes: list[dict]) -> dict:
                        for t, ms in topics.items()]}
 
 
-def check_open(reference: str, answer: str) -> dict:
+def check_open(reference: str, answer: str, key_points: list[str] | None = None) -> dict:
     a = {w for w in norm_for_match(answer).split() if len(w) > 3}
     r = {w for w in norm_for_match(reference).split() if len(w) > 3}
     share = len(a & r) / max(1, len(r))
     score = 1 if share >= 0.6 else 0.5 if share >= 0.3 else 0
-    return {"score": score, "comment": f"Совпало главных слов: {round(share * 100)} %."}
+    missing = [] if score == 1 else [kp for kp in (key_points or [reference]) if not
+                                     ({w for w in norm_for_match(kp).split() if len(w) > 3} <= a)]
+    return {"score": score, "comment": f"Совпало главных слов образца: {round(share * 100)} %.", "missing": missing}

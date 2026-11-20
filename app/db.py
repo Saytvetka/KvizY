@@ -112,6 +112,9 @@ class Quiz(Base):
     last_pct: Mapped[float | None] = mapped_column(sa.Double)
     attempts_count: Mapped[int | None] = mapped_column(sa.Integer, default=0)
     created_at: Mapped[dt.datetime | None] = mapped_column(sa.DateTime, default=now)
+    parent_id: Mapped[str | None] = mapped_column(Str)      # «Пройти тему ещё раз»: из какого квиза сделан
+    root_id: Mapped[str | None] = mapped_column(Str)        # первый квиз цепочки попыток темы
+    from_attempt_id: Mapped[str | None] = mapped_column(Str)  # по какой попытке брали ошибки
 
 
 class QuizText(Base):
@@ -139,6 +142,8 @@ class Question(Base):
     options: Mapped[str | None] = mapped_column(Txt)  # JSON: варианты / пары / шаги
     answer: Mapped[str | None] = mapped_column(Txt)   # JSON: правильный ответ (форма зависит от типа)
     explanation: Mapped[str | None] = mapped_column(Txt)
+    explain: Mapped[str | None] = mapped_column(Txt)    # JSON: {why, trap, remember, answer_text}
+    verified: Mapped[bool | None] = mapped_column(sa.Boolean)  # False — ответ не сходится с пояснением, в баллы не идёт
     quote: Mapped[str | None] = mapped_column(Txt)
     points: Mapped[float | None] = mapped_column(sa.Double, default=1)
     hint: Mapped[str | None] = mapped_column(Txt)

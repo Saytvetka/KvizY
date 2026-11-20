@@ -5,6 +5,7 @@
 - Как устроено и что где менять: [docs/karkas.md](docs/karkas.md)
 - Запуск в Yandex Cloud по шагам: [docs/yandex_cloud.md](docs/yandex_cloud.md)
 - Ошибки за проект и выводы: [docs/oshibki.md](docs/oshibki.md)
+- Проверка всего сайта, скриншоты: [docs/proverka.md](docs/proverka.md)
 
 Запуск на компьютере (с пробным ИИ, без денег):
 ```

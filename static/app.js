@@ -13,7 +13,7 @@ const PALETTE_NAMES = {
   terminal: "Терминал", sakura: "Сакура", desert: "Пустыня", deep: "Глубина", neon: "Неон",
 };
 const PALETTE_BG = {classic:"#ffffff",dark:"#121212",beige:"#f4ede1",bluegray:"#edf1f5",sage:"#edf1ea",terminal:"#050a05",sakura:"#fff4f6",desert:"#f2e5cf",deep:"#0a1828",neon:"#0c0a19"};
-const DIFF = { easy: "лёгкий", medium: "средний", hard: "на размышление" };
+const DIFF = { easy: "лёгкий", medium: "средний", hard: "сложный" };  // запасные названия; настоящие — из /api/bootstrap
 const PURPOSE = { quiz: "создание квиза", replace: "замена вопросов", check_open: "проверка ответов", subject_quiz: "квиз по предмету", ping: "проверка связи", review: "разбор ошибок" };
 
 const S = { boot: null, ready: false };   // общее состояние: данные /api/bootstrap
@@ -29,8 +29,20 @@ function fmtDate(iso) {
   const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
   return d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" }) + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 }
+// Числа на экране: до десятых, с запятой. Деньги — до копеек, с запятой.
 const num = (v) => String(Math.round((+v || 0) * 10) / 10).replace(".", ",");
-const pct = (v) => (v === null || v === undefined ? "—" : `${Math.round(v)} %`);
+const pct = (v) => (v === null || v === undefined ? "—" : `${num(v)} %`);
+const rub = (v) => `${(+v || 0).toFixed(2).replace(".", ",")} ₽`;
+const levels = () => (S.boot && S.boot.limits.levels) || {};
+const levelName = (k) => (levels()[k] || {}).name || DIFF[k] || "";
+const mult = (m) => `×${num(m)}`;
+const secText = (sec) => (sec >= 60 ? `${num(sec / 60)} мин` : `${sec} с`);
+const HINTS_TEXT = { all: "подсказки у всех вопросов", outside: "подсказки только у вопросов «вне файла»", none: "без подсказок" };
+/** Строка про уровень: что за вопросы, таймер, подсказки, множитель баллов. */
+function levelLine(k) {
+  const l = levels()[k]; if (!l) return "";
+  return `Таймер ${secText(l.timer_sec)} на вопрос (открытый — ${secText(l.timer_open_sec)}), ${HINTS_TEXT[l.hints]}, баллы ${mult(l.multiplier)}.`;
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- API ----------
@@ -145,18 +157,49 @@ $$("#drawer a").forEach((a) => (a.onclick = () => setMenu(false)));
 
 // ---------- Роутер ----------
 const routes = [
-  [/^\/?$/, pageHome], [/^\/create$/, pageCreate], [/^\/progress\/(\w+)$/, pageProgress],
+  [/^\/?$/, pageHome], [/^\/create$/, () => pageCreate()], [/^\/retry\/(\w+)$/, pageRetry], [/^\/progress\/(\w+)$/, pageProgress],
   [/^\/play\/(\w+)$/, pagePlay], [/^\/result\/(\w+)$/, pageResult], [/^\/history$/, pageHistory],
   [/^\/quiz\/(\w+)$/, pageQuiz], [/^\/stats$/, pageStats], [/^\/growth$/, pageGrowth],
   [/^\/subjects$/, pageSubjects], [/^\/subject\/(\w+)$/, pageSubject], [/^\/settings$/, pageSettings],
 ];
 let leaveHooks = [];
 function onLeave(fn) { leaveHooks.push(fn); }
-function go(path) { if (location.hash === "#" + path) route(); else location.hash = path; }
+/** Переход. replace=true — без записи в историю (чтобы «←» не вёл обратно в пройденный квиз). */
+function go(path, replace = false) {
+  if (location.hash === "#" + path) { route(); return; }
+  if (replace) { navReplace = true; location.replace("#" + path); } else location.hash = path;
+}
+
+// ---------- Кнопка «←» ----------
+// У приложения с экрана «Домой» нет кнопки «Назад» браузера, поэтому своя. Помним путь внутри приложения;
+// если идти некуда (открыли сразу на этой странице) — идём на «родительскую» страницу.
+let navStack = [];
+let navReplace = false;
+try { navStack = JSON.parse(sessionStorage.getItem("kvizy.nav") || "[]"); } catch (e) { navStack = []; }
+function trackNav(path) {
+  if (navReplace) { navStack[navStack.length - 1] = path; navReplace = false; }
+  else if (navStack.length >= 2 && navStack[navStack.length - 2] === path) navStack.pop();
+  else if (navStack[navStack.length - 1] !== path) navStack.push(path);
+  navStack = navStack.slice(-40);
+  try { sessionStorage.setItem("kvizy.nav", JSON.stringify(navStack)); } catch (e) {}
+  $("#back-btn").hidden = path === "/";
+}
+function parentOf(path) {
+  const [, a, id] = path.split("/");
+  return { play: `/quiz/${id}`, quiz: "/history", progress: "/history", result: "/history", retry: `/result/${id}`,
+    subject: "/subjects", growth: "/stats" }[a] || "/";
+}
+$("#back-btn").onclick = () => {
+  const path = location.hash.replace(/^#/, "") || "/";
+  if (navStack.length >= 2 && navStack[navStack.length - 1] === path) history.back();
+  else go(parentOf(path), true);
+};
+
 async function route() {
   leaveHooks.forEach((f) => { try { f(); } catch (e) {} }); leaveHooks = [];
   if (!S.ready) return;
   const path = location.hash.replace(/^#/, "") || "/";
+  trackNav(path);
   const nav = path.split("/")[1] || "home";
   $$("#drawer a").forEach((a) => a.classList.toggle("active", a.dataset.nav === (nav === "" ? "home" : nav) ||
     (a.dataset.nav === "history" && nav === "quiz") || (a.dataset.nav === "subjects" && nav === "subject")));
@@ -224,18 +267,21 @@ function pageHome() {
     <a class="btn secondary block" href="#/history">История квизов</a></div>`;
 }
 
-// ---------- Создать квиз ----------
-function pageCreate() {
-  setTitle("Создать квиз");
-  const f = S.boot.form || {};
+// ---------- Создать квиз (и «Пройти тему ещё раз» — та же форма, уже заполненная) ----------
+/** retry — данные итога (/api/attempts/<id>): тот же текст и диапазон, настройки можно поменять. */
+function pageCreate(retry = null) {
+  setTitle(retry ? "Пройти тему ещё раз" : "Создать квиз");
+  const f = retry ? { ...(S.boot.form || {}), ...Object.fromEntries(Object.entries(retry.settings).filter(([, v]) => v !== null && v !== undefined)) } : (S.boot.form || {});
   const lim = S.boot.limits;
   const files = [];
   const choices = lim.choices;
   const count0 = f.count || 10;
-  view.innerHTML = `<h1>Новый квиз</h1>
-  <form id="cf" autocomplete="off">
-    <label class="field"><span>Предмет</span><input type="text" name="subject" list="subj-list" required value="${esc(f.subject || "")}" placeholder="например, Химия">
-      <datalist id="subj-list">${S.boot.subjects.map((s) => `<option value="${esc(s)}">`).join("")}</datalist></label>
+  const diff0 = levels()[f.difficulty] ? f.difficulty : "medium";
+  const material = retry ? `<div class="panel"><b>Материал — тот же</b>
+      <p class="muted small">Тот же текст и тот же диапазон «откуда–докуда», что в квизе «${esc(retry.title)}». Вопросы будут новые: ИИ получит список уже заданных, а похожие программа отбросит сама.</p>
+      ${retry.retry_mistakes ? `<label class="toggle"><span>Взять вопросы, где были ошибки <small class="muted" id="mist-line"></small></span><input type="checkbox" name="use_mistakes" checked><span class="sw"></span></label>` : `<p class="small">Ошибок не было — все вопросы будут новые.</p>`}
+    </div>` : `<label class="field"><span>Предмет</span><input type="text" name="subject" list="subj-list" required value="${esc(f.subject || "")}" placeholder="например, Химия">
+      <datalist id="subj-list">${S.boot.subjects.map((x) => `<option value="${esc(x)}">`).join("")}</datalist></label>
     <label class="field"><span>Тема (название квиза)</span><input type="text" name="topic" required placeholder="например, Электролиз"></label>
     <div class="panel"><b>Материал</b>
       <div class="field"><span><b>Файлы</b></span><label class="btn secondary block" style="margin-top:6px">Выбрать файлы<input type="file" id="file-in" multiple accept=".pdf,.docx,.pptx,.txt,.md,application/pdf" hidden></label>
@@ -245,49 +291,112 @@ function pageCreate() {
       <label class="field"><span>Ссылки на страницы</span><textarea name="urls" rows="2" style="min-height:70px" placeholder="по одной в строке"></textarea></label>
     </div>
     <label class="field"><span>Откуда и докуда читать</span><input type="text" name="range" placeholder="например: со слайда 5 до 12 · только 2-й файл · с раздела «Электролиз» до конца">
-      <small>Можно оставить пустым — тогда весь материал.</small></label>
+      <small>Можно оставить пустым — тогда весь материал.</small></label>`;
+  view.innerHTML = `<h1>${retry ? esc(retry.title) + ": ещё раз" : "Новый квиз"}</h1>
+  <form id="cf" autocomplete="off">
+    ${material}
     <div class="field"><span><b>Число вопросов</b></span>
       <div class="seg" id="count-seg" style="margin-top:6px">${choices.map((c) => `<button type="button" data-v="${c}" class="${c === count0 ? "on" : ""}">${c}</button>`).join("")}
         <button type="button" data-v="custom" class="${choices.includes(count0) ? "" : "on"}">своё</button></div>
       <input type="number" name="count_custom" min="1" max="${lim.max_questions}" value="${count0}" ${choices.includes(count0) ? "hidden" : ""} style="margin-top:8px"></div>
     <div class="field"><span><b>Сложность</b></span>
-      <div class="seg" id="diff-seg" style="margin-top:6px">${Object.entries(DIFF).map(([k, v]) => `<button type="button" data-v="${k}" class="${(f.difficulty || "medium") === k ? "on" : ""}">${v}</button>`).join("")}</div></div>
-    <label class="toggle"><span>Таймер <small class="muted">(${lim.timer.easy} с / ${lim.timer.medium} с / ${lim.timer.hard / 60} мин на вопрос)</small></span><input type="checkbox" name="timer" ${f.timer ? "checked" : ""}><span class="sw"></span></label>
-    <label class="toggle"><span>Подсказки <small class="muted">(у вопросов «вне файла» и «на логику»)</small></span><input type="checkbox" name="hints" ${f.hints ? "checked" : ""}><span class="sw"></span></label>
+      <div class="seg" id="diff-seg" style="margin-top:6px">${Object.entries(levels()).map(([k, v]) => `<button type="button" data-v="${k}" class="${diff0 === k ? "on" : ""}">${esc(v.name)} <small>${mult(v.multiplier)}</small></button>`).join("")}</div>
+      <p class="level-note" id="level-line"></p></div>
+    <label class="toggle"><span>Таймер <small class="muted" id="timer-note"></small></span><input type="checkbox" name="timer" ${f.timer ? "checked" : ""}><span class="sw"></span></label>
+    <label class="toggle"><span>Подсказки <small class="muted" id="hints-note"></small></span><input type="checkbox" name="hints" ${f.hints ? "checked" : ""}><span class="sw"></span></label>
     <div id="cf-err"></div>
-    <button class="btn block" type="submit" style="margin-top:12px">Создать квиз</button>
+    <button class="btn block" type="submit" style="margin-top:12px">${retry ? "Собрать новый квиз" : "Создать квиз"}</button>
   </form>`;
   const form = $("#cf");
   const seg = (id) => { const el = $(id); el.onclick = (e) => { const b = e.target.closest("button"); if (!b) return; $$("button", el).forEach((x) => x.classList.toggle("on", x === b)); el.dispatchEvent(new Event("change")); }; return el; };
   const countSeg = seg("#count-seg");
-  countSeg.addEventListener("change", () => { form.count_custom.hidden = $(".on", countSeg).dataset.v !== "custom"; });
-  seg("#diff-seg");
+  const getCount = () => { const cv = $(".on", countSeg).dataset.v; return cv === "custom" ? parseInt(form.count_custom.value, 10) : parseInt(cv, 10); };
+  const mistLine = () => {
+    const el = $("#mist-line"); if (!el) return;
+    const k = Math.min(retry.retry_mistakes, Math.round((getCount() || 0) * lim.retry_share));
+    el.textContent = form.use_mistakes.checked ? `(${k} из ${getCount() || 0} — из ошибок, остальные новые)` : "(все вопросы новые)";
+  };
+  countSeg.addEventListener("change", () => { form.count_custom.hidden = $(".on", countSeg).dataset.v !== "custom"; mistLine(); });
+  form.count_custom.oninput = mistLine;
+  if (form.use_mistakes) form.use_mistakes.onchange = mistLine;
+  mistLine();
+  const diffSeg = seg("#diff-seg");
+  const showLevel = () => {
+    const k = $(".on", diffSeg).dataset.v; const l = levels()[k];
+    $("#level-line").textContent = levelLine(k);
+    $("#timer-note").textContent = `(${secText(l.timer_sec)} на вопрос, открытый — ${secText(l.timer_open_sec)})`;
+    $("#hints-note").textContent = l.hints === "none" ? "(на этом уровне подсказок нет)" : `(${HINTS_TEXT[l.hints]})`;
+    form.hints.disabled = l.hints === "none";
+  };
+  diffSeg.addEventListener("change", showLevel);
+  showLevel();
   const renderFiles = () => {
-    $("#file-list").innerHTML = files.map((fl, i) => `<li><span>${esc(fl.name)}</span><small class="muted">${(fl.size / 1048576).toFixed(1)} МБ</small><button type="button" class="x-btn" data-i="${i}" aria-label="Убрать">×</button></li>`).join("");
+    $("#file-list").innerHTML = files.map((fl, i) => `<li><span>${esc(fl.name)}</span><small class="muted">${num(fl.size / 1048576)} МБ</small><button type="button" class="x-btn" data-i="${i}" aria-label="Убрать">×</button></li>`).join("");
   };
-  $("#file-in").onchange = (e) => {
-    for (const fl of e.target.files) {
-      if (files.length >= lim.max_files) { toast(`Не больше ${lim.max_files} файлов`); break; }
-      if (fl.size > lim.max_file_mb * 1048576) { toast(`«${fl.name}» больше ${lim.max_file_mb} МБ`); continue; }
-      if (!/\.(pdf|docx|pptx|txt|md)$/i.test(fl.name)) { toast(`«${fl.name}»: такой тип не подходит`); continue; }
-      files.push(fl);
-    }
-    e.target.value = ""; renderFiles();
-  };
-  $("#file-list").onclick = (e) => { const b = e.target.closest("button[data-i]"); if (b) { files.splice(+b.dataset.i, 1); renderFiles(); } };
+  if (!retry) {
+    $("#file-in").onchange = (e) => {
+      for (const fl of e.target.files) {
+        if (files.length >= lim.max_files) { toast(`Не больше ${lim.max_files} файлов`); break; }
+        if (fl.size > lim.max_file_mb * 1048576) { toast(`«${fl.name}» больше ${lim.max_file_mb} МБ`); continue; }
+        if (!/\.(pdf|docx|pptx|txt|md)$/i.test(fl.name)) { toast(`«${fl.name}»: такой тип не подходит`); continue; }
+        files.push(fl);
+      }
+      e.target.value = ""; renderFiles();
+    };
+    $("#file-list").onclick = (e) => { const b = e.target.closest("button[data-i]"); if (b) { files.splice(+b.dataset.i, 1); renderFiles(); } };
+  }
   form.onsubmit = async (e) => {
     e.preventDefault();
-    const cv = $(".on", countSeg).dataset.v;
-    const count = cv === "custom" ? parseInt(form.count_custom.value, 10) : parseInt(cv, 10);
-    if (!count || count < 1 || count > lim.max_questions) { toast(`Число вопросов — от 1 до ${lim.max_questions}`); return; }
+    $("#cf-err").innerHTML = "";
+    const count = getCount();
+    if (!count || count < 1 || count > lim.max_questions) { errorBox("#cf-err", `Число вопросов — от 1 до ${lim.max_questions}.`, null, "Проверь число вопросов"); return; }
+    const difficulty = $(".on", diffSeg).dataset.v;
+    const hints = form.hints.checked && !form.hints.disabled;
+    if (retry) { runRetry(retry, { count, difficulty, timer: form.timer.checked, hints, use_mistakes: form.use_mistakes ? form.use_mistakes.checked : false }); return; }
     const urls = form.urls.value.split(/\s+/).map((u) => u.trim()).filter(Boolean);
     if (!files.length && !form.text.value.trim() && !urls.length) { errorBox("#cf-err", "Добавь материал: файл, текст или ссылку.", null, "Нет материала"); return; }
     const body = {
-      subject: form.subject.value, topic: form.topic.value, count, difficulty: $(".on", $("#diff-seg")).dataset.v,
-      timer: form.timer.checked, hints: form.hints.checked, source_range: form.range.value, text: form.text.value, urls, uploads: [],
+      subject: form.subject.value, topic: form.topic.value, count, difficulty,
+      timer: form.timer.checked, hints, source_range: form.range.value, text: form.text.value, urls, uploads: [],
     };
     runCreation(body, files.slice());
   };
+}
+
+async function pageRetry(attemptId) {
+  setTitle("Пройти тему ещё раз");
+  loading();
+  const r = await api(`/api/attempts/${attemptId}`);
+  if (r.kind !== "normal") { errorBox(view, "Это квиз по предмету — новый такой квиз собирается на странице предмета.", null, "Здесь так нельзя"); return; }
+  pageCreate(r);
+}
+
+/** «Пройти тему ещё раз»: новый квиз (старый не трогаем) → вопросы со статусами → прохождение. */
+async function runRetry(r, opts) {
+  setTitle("Делаю квиз");
+  view.innerHTML = `<h1>${esc(r.title)}: ещё раз</h1><div class="panel"><div class="row"><div class="spinner" id="cr-spin"></div><b id="cr-now">готовлю…</b></div>
+    <ul class="status-lines" id="cr-lines"></ul></div><div id="cr-err"></div>
+    <p class="muted small">Старый квиз и его итог остаются как были. Обычно это 20–90 секунд.</p>`;
+  const lines = $("#cr-lines");
+  const step = (text) => {
+    $$("li.now", lines).forEach((li) => { li.classList.remove("now"); li.classList.add("done"); });
+    const li = document.createElement("li"); li.className = "now"; li.textContent = text; lines.appendChild(li);
+    $("#cr-now").textContent = text;
+  };
+  const fail = (err, retryFn) => {
+    $("#cr-spin").hidden = true;
+    errorBox("#cr-err", err, retryFn, "Новый квиз не собрался");
+    const back = document.createElement("a"); back.className = "btn secondary block"; back.href = `#/result/${r.attempt_id}`;
+    back.textContent = "← К итогу прошлой попытки"; $("#cr-err").appendChild(back);
+  };
+  let made;
+  try {
+    step("беру тот же текст…");
+    made = await api(`/api/attempts/${r.attempt_id}/retry`, { method: "POST", json: opts });
+    S.boot.form = { ...(S.boot.form || {}), count: opts.count, difficulty: opts.difficulty, timer: opts.timer, hints: opts.hints };
+    if (made.mistakes) step(`из ошибок прошлой попытки: ${made.mistakes} вопр.`);
+  } catch (err) { fail(err, () => runRetry(r, opts)); return; }
+  await generateWithStatus(made.quiz_id, step, fail);
 }
 
 /** Создание квиза со статусами: загрузка файлов → чтение → вопросы → проверка. */
@@ -323,6 +432,7 @@ async function runCreation(body, files) {
     step("читаю файлы…");
     const made = await api("/api/quizzes", { method: "POST", json: body });
     S.boot.form = { subject: body.subject, count: body.count, difficulty: body.difficulty, timer: body.timer, hints: body.hints };
+    $("#cr-err").innerHTML = "";
     if (!S.boot.subjects.includes(body.subject.trim())) S.boot.subjects.push(body.subject.trim());
     const warn = [...(made.warnings || [])];
     if (made.range_note) warn.push(`Взял только часть: ${made.range_note}.`);
@@ -356,7 +466,7 @@ async function generateWithStatus(quizId, step, fail) {
     done = true;
     if (res.warnings && res.warnings.length) toast(res.warnings.join(" "), 6000);
     step("готово!");
-    go(`/play/${quizId}`);
+    go(`/play/${quizId}`, true);
   } catch (err) {
     if (done) return;
     // Запрос мог оборваться (связь), а квиз всё равно доделывается — ждём по статусу.
@@ -365,7 +475,7 @@ async function generateWithStatus(quizId, step, fail) {
         await sleep(2000);
         try {
           const st = await api(`/api/quizzes/${quizId}/status`);
-          if (st.status === "ready") { done = true; go(`/play/${quizId}`); return; }
+          if (st.status === "ready") { done = true; go(`/play/${quizId}`, true); return; }
           if (st.status === "error") break;
         } catch (e) { /* ещё нет связи */ }
       }
@@ -388,14 +498,14 @@ async function pageProgress(quizId) {
   };
   const fail = (err, retry) => { $("#cr-spin").hidden = true; errorBox("#cr-err", err, retry); };
   const st = await api(`/api/quizzes/${quizId}/status`);
-  if (st.status === "ready") { go(`/play/${quizId}`); return; }
+  if (st.status === "ready") { go(`/play/${quizId}`, true); return; }
   if (st.status === "running") {
     step(st.status_text || "делаю вопросы…");
     for (;;) {
       await sleep(2000);
       if (!location.hash.includes(quizId)) return;
       const s2 = await api(`/api/quizzes/${quizId}/status`);
-      if (s2.status === "ready") { go(`/play/${quizId}`); return; }
+      if (s2.status === "ready") { go(`/play/${quizId}`, true); return; }
       if (s2.status === "error") { fail(new Error(s2.error), () => pageProgress(quizId)); return; }
       if (s2.status_text) $("#cr-now").textContent = s2.status_text;
     }
@@ -411,7 +521,8 @@ async function pagePlay(quizId) {
   setTitle(at.title);
   const st = { at, idx: 0, streak: 0, start: Date.now(), cardStart: Date.now(), timer: null, answered: false, busy: false };
   view.innerHTML = `<div class="play-top"><span class="counter" id="pl-count"></span><div class="progress"><i id="pl-bar"></i></div>
-      <span class="streak" id="pl-streak" title="Правильных подряд"></span></div>
+      <span class="streak" id="pl-streak" title="Правильных подряд"></span>
+      <span class="mult-chip" title="Множитель баллов уровня «${esc(at.level.name)}»">${mult(at.level.multiplier)}</span></div>
     <div class="timer" id="pl-timer" hidden><i></i></div><div class="timer-text" id="pl-timer-text" hidden></div>
     <div class="card-stage" id="stage"></div>`;
   onLeave(() => clearInterval(st.timer));
@@ -421,7 +532,7 @@ async function pagePlay(quizId) {
     $("#pl-bar").style.width = `${(st.idx / n) * 100}%`;
     $("#pl-streak").textContent = st.streak > 0 ? `серия ${st.streak} 🔥` : "серия 0";
   };
-  const secondsFor = (q) => at.seconds[q.difficulty] || at.default_seconds;
+  const secondsFor = (q) => q.seconds || at.level.timer_sec;
 
   const startTimer = (q) => {
     clearInterval(st.timer);
@@ -468,15 +579,16 @@ async function pagePlay(quizId) {
     if (st.busy || st.answered) return;
     st.busy = true; btn.disabled = true; btn.textContent = "…";
     clearInterval(st.timer);
+    let msg = null;
     try {
       const r = await api(`/api/questions/${q.id}/replace`, { method: "POST" });
-      toast(r.message, 4000);
-      if (r.changed) { at.questions[st.idx] = r.question; showCard(false); }
-      else { at.questions[st.idx].replace_count = r.question.replace_count; showCard(false); }
+      if (r.changed) { at.questions[st.idx] = { ...r.question, seconds: r.question.qtype === "open" ? at.level.timer_open_sec : at.level.timer_sec }; toast(r.message, 4000); }
+      else { at.questions[st.idx].replace_count = r.question.replace_count; msg = r.message; }
     } catch (e) {
-      toast(`Замена не вышла: ${e.message}`, 6000);
-      showCard(false);
+      msg = `Замена не вышла: ${e.message}`;
     } finally { st.busy = false; }
+    showCard(false);
+    if (msg) { const box = $("#stage .card-msg"); if (box) errorBox(box, msg, null, "Вопрос не заменён"); }
   };
 
   const submit = async (response) => {
@@ -527,8 +639,9 @@ async function pagePlay(quizId) {
     st.streak = ok ? st.streak + 1 : 0;
     const v = document.createElement("div");
     v.className = "verdict" + (res.partial ? " partial" : "");
-    v.innerHTML = ok ? `<span class="ic">✓</span>Верно` : res.partial ? `<span class="ic">½</span>Частично: ${num(res.score)} из ${num(res.max)}` :
-      response.timeout ? `<span class="ic">✕</span>Время вышло` : `<span class="ic">✕</span>Неверно`;
+    v.innerHTML = (ok ? `<span class="ic">✓</span>Верно` : res.partial ? `<span class="ic">½</span>Частично` + (res.counted ? `: ${num(res.score)} из ${num(res.max)}` : "") :
+      response.timeout ? `<span class="ic">✕</span>Время вышло` : `<span class="ic">✕</span>Неверно`) +
+      (res.counted === false ? ` <small class="muted">(не в баллах: вопрос не проверен)</small>` : ok ? ` <small class="muted">+${num(res.score)}</small>` : "");
     btns.before(v);
     updTop();
     const last = st.idx >= n - 1;
@@ -536,10 +649,11 @@ async function pagePlay(quizId) {
     $("[data-act=next]", btns).onclick = async () => {
       if (!last) { st.idx++; showCard(true); return; }
       const nb = $("[data-act=next]", btns); nb.disabled = true; nb.textContent = "считаю…";
+      const msgBox = $(".card-msg", card); msgBox.innerHTML = "";
       try {
         const r = await api(`/api/attempts/${at.attempt_id}/finish`, { method: "POST", json: { duration: Math.round((Date.now() - st.start) / 1000) } });
-        go(`/result/${r.attempt_id}`);
-      } catch (e) { nb.disabled = false; nb.textContent = "Итог"; toast(`Не посчиталось: ${e.message}. Нажми ещё раз.`, 6000); }
+        go(`/result/${r.attempt_id}`, true);
+      } catch (e) { nb.disabled = false; nb.textContent = "Итог"; errorBox(msgBox, `${e.message}. Ответы сохранены — нажми «Итог» ещё раз.`, null, "Итог не посчитался"); }
     };
   };
 
@@ -549,6 +663,7 @@ async function pagePlay(quizId) {
 function cardHTML(q, at) {
   const tags = [`<span class="tag">${esc(q.topic || "")}${q.subtopic ? " · " + esc(q.subtopic) : ""}</span>`, `<span class="tag">${esc(q.type_name)}</span>`];
   if (q.flag_name) tags.push(`<span class="tag flag">${esc(q.flag_name)}</span>`);
+  if (q.verified === false) tags.push(`<span class="tag unv" title="Ответ ИИ не сошёлся с пояснением — вопрос не идёт в баллы">не проверено</span>`);
   const left = at.max_replaces - (q.replace_count || 0);
   let body = "";
   const o = q.options;
@@ -569,7 +684,7 @@ function cardHTML(q, at) {
   const hint = at.hints && q.hint ? `<button type="button" class="btn small secondary" data-act="hint" style="margin-top:12px">Подсказка</button><div class="hint-box" hidden>${esc(q.hint)}</div>` : "";
   return `<button type="button" class="replace-btn" data-act="replace" ${left <= 0 ? "disabled" : ""} title="Заменить вопрос (осталось ${left})" aria-label="Заменить вопрос">↻ ${left}</button>
     <div class="q-meta">${tags.join("")}</div><div class="q-text">${esc(q.text)}</div>${body}${hint}
-    <div class="actions"><button class="btn block" data-act="answer">Ответить</button></div>`;
+    <div class="card-msg"></div><div class="actions"><button class="btn block" data-act="answer">Ответить</button></div>`;
 }
 
 /** Привязать поля карточки. getResponse() → ответ или null (если ещё ничего не выбрано). */
@@ -605,6 +720,19 @@ function bindInputs(card, q) {
 }
 
 // ---------- Итог ----------
+/** Пояснение карточки: почему верно, ловушка, что запомнить; цитата — только проверенная кодом. */
+function explainHTML(c) {
+  const rows = [];
+  if (c.outside) rows.push(`<div class="scope-note">Вопрос шире твоего файла: в материале этого нет, ответ — общее знание по теме. Цитаты из файла здесь нет.</div>`);
+  if (c.why) rows.push(`<div><b>Почему так:</b> ${esc(c.why)}</div>`);
+  if (c.trap) rows.push(`<div><b>Ловушка:</b> ${esc(c.trap)}</div>`);
+  if (c.remember) rows.push(`<div><b>Запомни:</b> ${esc(c.remember)}</div>`);
+  if (c.qtype === "open" && c.note) rows.push(`<div class="note-pre"><b>Оценка по образцу:</b> ${esc(c.note)}</div>`);
+  if (c.quote) rows.push(`<div><b>В файле:</b><blockquote>${esc(c.quote)}</blockquote></div>`);
+  if (!c.counted) rows.push(`<div class="scope-note">Не в баллах: ответ ИИ не сошёлся с его же пояснением даже со второй попытки, поэтому вопрос помечен «не проверено».</div>`);
+  return rows.length ? `<div class="explain">${rows.join("")}</div>` : "";
+}
+
 async function pageResult(attemptId) {
   setTitle("Итог");
   loading();
@@ -617,26 +745,33 @@ async function pageResult(attemptId) {
     return bars([t]) + (ss.length >= 2 ? bars(ss, true) : "");
   }).join("");
   const mins = r.duration ? `${Math.floor(r.duration / 60)} мин ${r.duration % 60} с` : "";
-  view.innerHTML = `<h1>${esc(r.title)}</h1>
-    <div class="panel"><div class="big-pct">${pct(r.pct)}</div><div class="muted">${num(r.score)} из ${num(r.max)} баллов${mins ? " · " + mins : ""}</div>
-    ${r.unchecked ? `<div class="warn-box">Не проверено открытых ответов: ${r.unchecked}. Они пока считаются как 0.</div>` : ""}</div>
-    <h2>По темам</h2><div class="panel bars">${topicBlock || '<span class="muted">нет данных</span>'}</div>
-    ${r.mistakes ? `<h2>Разбор ошибок</h2><div class="panel" id="review"></div>` : ""}
-    <h2>Все карточки</h2><p class="muted small">У ошибок сразу видно правильный ответ и объяснение. Тапни на карточку — увидишь всё подробно и цитату.</p>
+  const perfect = r.mistakes === 0;
+  const k = Math.min(r.retry_mistakes, Math.round((r.settings.count || r.cards.length) * r.retry_share));
+  const retryBlock = r.kind === "normal" ? `<div class="retry-box"><a class="btn block" href="#/retry/${r.attempt_id}">${perfect ? "Пройти тему ещё раз" : "Пройти тему ещё раз с ошибками"}</a>
+      <p class="help">${perfect ? "Все ответы верные — будут только новые вопросы по тому же тексту." : k ? `${k} вопр. — из твоих ошибок, остальные новые. Тот же текст и настройки, перед стартом можно поменять.` : "Новые вопросы по тому же тексту. Перед стартом настройки можно поменять."}</p></div>`
+    : r.subject_id ? `<div class="retry-box"><a class="btn block" href="#/subject/${r.subject_id}">Ещё квиз по предмету</a></div>` : "";
+  const chain = r.chain.length ? `<div class="chain" aria-label="Попытки темы">${r.chain.map((c) => c.current ? `<span class="cur">${c.round}-й раз · ${pct(c.last_pct)}</span>` : `<a href="#/quiz/${c.quiz_id}">${c.round}-й раз · ${pct(c.last_pct)}</a>`).join("")}</div>` : "";
+  view.innerHTML = `<h1>${esc(r.title)}</h1>${chain}
+    <div class="panel"><div class="big-pct">${pct(r.pct)}</div><div class="muted">${num(r.score)} из ${num(r.max)} баллов · уровень «${esc(r.level.name)}», баллы <span class="mult-chip">${mult(r.level.multiplier)}</span>${mins ? " · " + mins : ""}</div>
+    ${r.unchecked ? `<div class="warn-box">Не проверено открытых ответов: ${r.unchecked}. Они пока считаются как 0.</div>` : ""}
+    ${r.uncounted ? `<div class="warn-box">Вопросов «не проверено» (не в баллах): ${r.uncounted}.</div>` : ""}
+    ${retryBlock}</div>
+    <h2>Ошибки и пояснения</h2><p class="muted small">У каждой ошибки сразу видно правильный ответ и почему. Тапни на карточку — увидишь свой ответ и подробности. Этот разбор сохранён: его можно открыть позже из Истории.</p>
     <ul class="list" id="cards">${r.cards.map((c, i) => `<li><button type="button" class="item ${c.correct ? "ok" : "bad"}" data-i="${i}">
-      <div class="t">${i + 1}. ${esc(c.text)}</div><div class="s"><span>${c.correct ? "✓ верно" : c.score > 0 ? "½ частично" : "✕ неверно"}</span><span>${num(c.score)} из ${num(c.max)}</span><span>${esc(c.topic || "")}</span></div>
-      ${c.correct ? "" : `<div class="why"><div><b>Правильно:</b> ${esc(c.right_answer)}</div>${c.explanation ? `<div style="margin-top:6px">${esc(c.explanation)}</div>` : ""}</div>`}
+      <div class="t">${i + 1}. ${esc(c.text)}</div><div class="s"><span>${c.correct ? "✓ верно" : c.score > 0 ? "½ частично" : c.status === "missing" ? "нет ответа" : "✕ неверно"}</span><span>${c.counted ? `${num(c.score)} из ${num(c.max)}` : "не в баллах"}</span><span>${esc(c.topic || "")}</span></div>
+      ${c.correct ? "" : `<div class="why"><div><b>Правильно:</b> ${esc(c.right_answer)}</div>${explainHTML(c)}</div>`}
       <div class="detail" hidden></div></button></li>`).join("")}</ul>
-    <div class="actions"><a class="btn" href="#/play/${r.quiz_id}">Пройти снова</a><a class="btn secondary" href="#/history">В историю</a></div>`;
+    <h2>По темам</h2><div class="panel bars">${topicBlock || '<span class="muted">нет данных</span>'}</div>
+    ${r.mistakes ? `<h2>Разбор тем с ошибками</h2><div class="panel" id="review"></div>` : ""}
+    <div class="actions"><a class="btn secondary" href="#/play/${r.quiz_id}">Пройти этот же квиз</a><a class="btn secondary" href="#/history">В историю</a></div>`;
   if (r.mistakes) renderReview(r);
   $("#cards").onclick = (e) => {
     const b = e.target.closest("button.item"); if (!b) return;
     const d = $(".detail", b); const c = r.cards[+b.dataset.i];
     if (!d.innerHTML) {
       d.innerHTML = `<dl><dt>Вопрос</dt><dd>${esc(c.text)}</dd><dt>Твой ответ</dt><dd>${esc(c.your_answer)}</dd>
-        <dt>Правильный ответ</dt><dd>${esc(c.right_answer)}</dd><dt>Баллы</dt><dd>${num(c.score)} из ${num(c.max)}${c.note ? " · " + esc(c.note) : ""}</dd>
-        ${c.explanation ? `<dt>Объяснение</dt><dd>${esc(c.explanation)}</dd>` : ""}
-        ${c.quote ? `<dt>Из материала</dt><dd><blockquote>${esc(c.quote)}</blockquote></dd>` : ""}
+        <dt>Правильный ответ</dt><dd>${esc(c.right_answer)}</dd><dt>Баллы</dt><dd>${c.counted ? `${num(c.score)} из ${num(c.max)}` : "не в баллах"}${c.note && c.qtype !== "open" ? " · " + esc(c.note) : ""}</dd>
+        ${c.correct ? `<dt>Пояснение</dt><dd>${explainHTML(c) || "—"}</dd>` : ""}
         ${c.flag_name ? `<dt>Пометка</dt><dd>${esc(c.flag_name)}</dd>` : ""}</dl>`;
     }
     d.hidden = !d.hidden;
@@ -672,9 +807,10 @@ async function pageHistory() {
   const list = await api("/api/quizzes");
   if (!list.length) { view.innerHTML = `<h1>История</h1><p class="muted">Квизов пока нет.</p><a class="btn block" href="#/create">Создать квиз</a>`; return; }
   view.innerHTML = `<h1>История</h1><ul class="list">${list.map((q) => `<li><a class="item" href="#/quiz/${q.id}">
-    <div class="t">${esc(q.topic)}</div><div class="s"><span>${fmtDate(q.date)}</span><span>${esc(q.subject)}</span>${q.kind === "subject" ? "<span>по предмету</span>" : ""}
+    <div class="t">${esc(q.topic)}${q.round > 1 ? ` <small class="muted">· ${q.round}-й раз</small>` : ""}</div><div class="s"><span>${fmtDate(q.date)}</span><span>${esc(q.subject)}</span>${q.kind === "subject" ? "<span>по предмету</span>" : ""}${q.difficulty ? `<span>${esc(levelName(q.difficulty))}</span>` : ""}
     ${q.status === "ready" ? `<span>лучший <span class="pct-chip">${pct(q.best_pct)}</span></span><span>последний <span class="pct-chip">${pct(q.last_pct)}</span></span>` :
-      q.status === "error" ? `<span class="status-chip error">ошибка</span>` : `<span class="status-chip running">делается…</span>`}</div></a></li>`).join("")}</ul>`;
+      q.status === "error" ? `<span class="status-chip error">ошибка</span>` : `<span class="status-chip running">делается…</span>`}</div></a>
+    ${q.last_attempt_id ? `<a class="item-extra" href="#/result/${q.last_attempt_id}">Разбор последней попытки →</a>` : ""}</li>`).join("")}</ul>`;
 }
 
 async function pageQuiz(quizId) {
@@ -684,26 +820,28 @@ async function pageQuiz(quizId) {
   setTitle(q.topic);
   const p = q.params || {};
   const sources = (q.sources || []).map((s) => s.kind === "url" ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.name)}</a>` : esc(s.name)).join(", ");
-  view.innerHTML = `<h1>${esc(q.topic)}</h1>
+  const chain = q.chain.length > 1 ? `<div class="chain" aria-label="Попытки темы">${q.chain.map((c) => c.current ? `<span class="cur">${c.round}-й раз · ${pct(c.last_pct)}</span>` : `<a href="#/quiz/${c.quiz_id}">${c.round}-й раз · ${pct(c.last_pct)}</a>`).join("")}</div>` : "";
+  view.innerHTML = `<h1>${esc(q.topic)}</h1>${chain}
     <div class="panel kv"><span>Предмет</span><span class="v">${esc(q.subject)}</span>
       <span>Создан</span><span class="v">${fmtDate(q.date)}</span><span>Вопросов</span><span class="v">${q.questions}</span>
-      <span>Сложность</span><span class="v">${DIFF[p.difficulty] || ""}</span><span>Таймер / подсказки</span><span class="v">${p.timer ? "да" : "нет"} / ${p.hints ? "да" : "нет"}</span>
+      <span>Сложность</span><span class="v">${esc(q.level.name)} <span class="mult-chip">${mult(q.level.multiplier)}</span></span><span>Таймер / подсказки</span><span class="v">${p.timer ? "да" : "нет"} / ${p.hints && q.level.hints !== "none" ? "да" : "нет"}</span>
       <span>Лучший / последний</span><span class="v">${pct(q.best_pct)} / ${pct(q.last_pct)}</span></div>
     ${sources ? `<p class="small muted">Материал: ${sources}</p>` : ""}
     ${q.range_note ? `<p class="small muted">Взята часть: ${esc(q.range_note)}</p>` : ""}
     ${(q.warnings || []).map((w) => `<div class="warn-box">${esc(w)}</div>`).join("")}
     <div id="q-state"></div>
     <div class="actions" id="q-actions"></div>
-    <h2>Попытки</h2>${q.attempts.length ? `<ul class="list">${q.attempts.map((a) => `<li><a class="item" href="#/result/${a.id}"><div class="t"><span class="pct-chip">${pct(a.pct)}</span> · ${num(a.score)} из ${num(a.max)}</div><div class="s">${fmtDate(a.date)}</div></a></li>`).join("")}</ul>` : '<p class="muted">Попыток пока нет.</p>'}
-    <div class="actions" style="margin-top:28px"><button class="btn danger" id="q-del">Удалить квиз</button></div>`;
+    <h2>Попытки</h2>${q.attempts.length ? '<p class="muted small">Тапни на попытку — откроется итог с разбором ошибок.</p>' : ""}${q.attempts.length ? `<ul class="list">${q.attempts.map((a) => `<li><a class="item" href="#/result/${a.id}"><div class="t"><span class="pct-chip">${pct(a.pct)}</span> · ${num(a.score)} из ${num(a.max)}</div><div class="s">${fmtDate(a.date)}</div></a></li>`).join("")}</ul>` : '<p class="muted">Попыток пока нет.</p>'}
+    <div class="actions" style="margin-top:28px"><button class="btn danger" id="q-del">Удалить квиз</button></div><div id="q-del-err"></div>`;
   const acts = $("#q-actions");
   if (q.status === "ready") acts.innerHTML = `<a class="btn" href="#/play/${q.id}">${q.attempts.length ? "Пройти снова" : "Пройти"}</a>`;
   else if (q.status === "error") { errorBox("#q-state", q.error || "Квиз не доделан", () => go(`/progress/${q.id}`), "Квиз не доделан"); }
   else acts.innerHTML = `<a class="btn secondary" href="#/progress/${q.id}">Смотреть, как делается</a>`;
   $("#q-del").onclick = async () => {
     if (!(await confirmModal(`Удалить квиз «${q.topic}»? Сотрутся его текст, все попытки и его вопросы из квизов по предмету. Вернуть нельзя.`, "Удалить", true))) return;
-    try { await api(`/api/quizzes/${q.id}`, { method: "DELETE" }); toast("Квиз удалён"); go("/history"); }
-    catch (e) { toast(`Не удалилось: ${e.message}`, 6000); }
+    $("#q-del-err").innerHTML = "";
+    try { await api(`/api/quizzes/${q.id}`, { method: "DELETE" }); toast("Квиз удалён"); go("/history", true); }
+    catch (e) { errorBox("#q-del-err", e, () => $("#q-del").click(), "Квиз не удалился"); }
   };
 }
 
@@ -763,15 +901,18 @@ async function pageSubject(id) {
       <span>Средний последний результат</span><span class="v">${pct(s.avg_last_pct)}</span><span>Вопросов в запасе</span><span class="v">${s.pool}</span></div>
     <div class="panel"><b>Квиз по предмету</b><p class="muted small">Смесь: часть — твои старые вопросы (сначала где ошибался), часть — новые по всем материалам предмета.</p>
       <div class="seg" id="sq-count">${lim.choices.map((c) => `<button type="button" data-v="${c}" class="${c === (f.count || 10) ? "on" : ""}">${c}</button>`).join("")}</div>
-      <div class="seg" id="sq-diff" style="margin-top:8px">${Object.entries(DIFF).map(([k, v]) => `<button type="button" data-v="${k}" class="${(f.difficulty || "medium") === k ? "on" : ""}">${v}</button>`).join("")}</div>
+      <div class="seg" id="sq-diff" style="margin-top:8px">${Object.entries(levels()).map(([k, v]) => `<button type="button" data-v="${k}" class="${(f.difficulty || "medium") === k ? "on" : ""}">${esc(v.name)} <small>${mult(v.multiplier)}</small></button>`).join("")}</div>
+      <p class="level-note" id="sq-level"></p>
       <label class="toggle"><span>Таймер</span><input type="checkbox" id="sq-timer" ${f.timer ? "checked" : ""}><span class="sw"></span></label>
       <label class="toggle"><span>Подсказки</span><input type="checkbox" id="sq-hints" ${f.hints ? "checked" : ""}><span class="sw"></span></label>
       <button class="btn block" id="sq-go">Квиз по предмету</button><div id="sq-err"></div></div>
     <h2>Слабые темы</h2>${topicsBlock(s.topics)}
     <h2>Квизы предмета</h2><ul class="list">${s.quizzes.map((q) => `<li><a class="item" href="#/quiz/${q.id}"><div class="t">${esc(q.topic)}</div><div class="s">${q.kind === "subject" ? "<span>по предмету</span>" : ""}<span>последний ${pct(q.last_pct)}</span><span>попыток ${q.attempts}</span></div></a></li>`).join("")}</ul>`;
-  for (const id2 of ["#sq-count", "#sq-diff"]) { const el = $(id2); el.onclick = (e) => { const b = e.target.closest("button"); if (b) $$("button", el).forEach((x) => x.classList.toggle("on", x === b)); }; }
+  const sqLevel = () => { $("#sq-level").textContent = levelLine($("#sq-diff .on").dataset.v); };
+  for (const id2 of ["#sq-count", "#sq-diff"]) { const el = $(id2); el.onclick = (e) => { const b = e.target.closest("button"); if (b) $$("button", el).forEach((x) => x.classList.toggle("on", x === b)); sqLevel(); }; }
+  sqLevel();
   $("#sq-go").onclick = async () => {
-    const btn = $("#sq-go"); btn.disabled = true;
+    const btn = $("#sq-go"); btn.disabled = true; $("#sq-err").innerHTML = "";
     try {
       const r = await api(`/api/subjects/${id}/quiz`, { method: "POST", json: { count: +$("#sq-count .on").dataset.v, difficulty: $("#sq-diff .on").dataset.v, timer: $("#sq-timer").checked, hints: $("#sq-hints").checked } });
       go(`/progress/${r.quiz_id}`);
@@ -892,12 +1033,12 @@ async function pageSettings() {
     catch (err) { errorBox("#pw-msg", err, null, "Пароль не сменён"); }
   };
   const share = Math.min(100, (usage.total / (usage.budget || 1)) * 100);
-  $("#usage").innerHTML = `<div class="lbl" style="display:flex;justify-content:space-between"><b>${usage.total.toFixed(2)} ₽ из ${usage.budget} ₽</b><span class="muted small">${usage.month}</span></div>
+  $("#usage").innerHTML = `<div class="lbl" style="display:flex;justify-content:space-between"><b>${rub(usage.total)} из ${num(usage.budget)} ₽</b><span class="muted small">${usage.month}</span></div>
     <div class="bar" style="margin:8px 0 4px"><i style="width:${share}%"></i></div><p class="muted small">Только показ — ничего не блокируется.</p>
     <label class="field"><span>Бюджет в месяц, ₽</span><div class="row"><input type="number" id="budget" min="0" step="10" value="${usage.budget}" style="flex:1"><button class="btn small secondary" id="budget-save">Сохранить</button></div></label>
-    <h3>По типам запросов</h3>${usage.by_purpose.length ? `<div class="kv">${usage.by_purpose.map((p) => `<span>${esc(PURPOSE[p.purpose] || p.name)} <small class="muted">(${p.calls})</small></span><span class="v">${p.rub.toFixed(2)} ₽</span>`).join("")}</div>` : '<p class="muted">Пока ничего.</p>'}
-    <h3>По людям</h3>${(usage.by_user || []).length ? `<div class="kv">${usage.by_user.map((u) => `<span>${esc(u.name)}${u.limit !== null && u.limit !== undefined ? ` <small class="muted">(лимит ${u.limit} ₽)</small>` : ""}</span><span class="v">${u.rub.toFixed(2)} ₽</span>`).join("")}</div>` : '<p class="muted">Пока ничего.</p>'}
-    <h3>По квизам</h3>${usage.by_quiz.length ? `<div class="kv">${usage.by_quiz.map((q) => `<span>${esc(q.title)}</span><span class="v">${q.rub.toFixed(2)} ₽</span>`).join("")}</div>` : '<p class="muted">Пока ничего.</p>'}`;
+    <h3>По типам запросов</h3>${usage.by_purpose.length ? `<div class="kv">${usage.by_purpose.map((p) => `<span>${esc(PURPOSE[p.purpose] || p.name)} <small class="muted">(${p.calls})</small></span><span class="v">${rub(p.rub)}</span>`).join("")}</div>` : '<p class="muted">Пока ничего.</p>'}
+    <h3>По людям</h3>${(usage.by_user || []).length ? `<div class="kv">${usage.by_user.map((u) => `<span>${esc(u.name)}${u.limit !== null && u.limit !== undefined ? ` <small class="muted">(лимит ${num(u.limit)} ₽)</small>` : ""}</span><span class="v">${rub(u.rub)}</span>`).join("")}</div>` : '<p class="muted">Пока ничего.</p>'}
+    <h3>По квизам</h3>${usage.by_quiz.length ? `<div class="kv">${usage.by_quiz.map((q) => `<span>${esc(q.title)}</span><span class="v">${rub(q.rub)}</span>`).join("")}</div>` : '<p class="muted">Пока ничего.</p>'}`;
   $("#budget-save").onclick = async () => {
     try { await api("/api/settings/budget", { method: "PUT", json: { budget: parseFloat($("#budget").value) || 0 } }); toast("Бюджет сохранён"); }
     catch (e) { toast(e.message); }
@@ -919,7 +1060,7 @@ async function pageSettingsGuest() {
   const share = u.limit ? Math.min(100, (u.spent / u.limit) * 100) : 0;
   view.innerHTML = `<h1>Настройки</h1>
     <p class="muted">Ты вошёл как <b>${esc(S.boot.me.name || S.boot.me.login)}</b>.</p>
-    <h2>ИИ в этом месяце</h2><div class="panel"><b>${(u.spent || 0).toFixed(2)} ₽ из ${u.limit ?? "∞"} ₽</b>
+    <h2>ИИ в этом месяце</h2><div class="panel"><b>${rub(u.spent)} из ${u.limit === null || u.limit === undefined ? "∞" : num(u.limit)} ₽</b>
       <div class="bar" style="margin:8px 0 4px"><i style="width:${share}%"></i></div>
       <p class="muted small">Когда лимит кончится, новые квизы и замена вопросов не будут работать до 1-го числа. Пройти уже созданные квизы можно всегда.</p></div>
     <h2>Палитра</h2><div class="palettes" id="pals">${st.palettes.map((p) => `<button type="button" class="pal ${p === st.palette ? "on" : ""}" data-p="${p}" data-palette="${p}" style="background:var(--bg);color:var(--text)">${esc(PALETTE_NAMES[p] || p)}
@@ -958,7 +1099,7 @@ function renderGuests(list) {
     <div id="g-new-creds"></div>
     ${list.length ? `<ul class="list" style="margin:12px 0">${list.map((g) => `<li class="item" data-id="${g.id}">
       <div class="t">${esc(g.name)} <small class="muted mono">${esc(g.login)}</small> ${g.active ? "" : '<span class="status-chip error">выключен</span>'}</div>
-      <div class="s"><span>ИИ: ${g.spent.toFixed(2)} из ${g.limit} ₽</span></div>
+      <div class="s"><span>ИИ: ${rub(g.spent)} из ${num(g.limit)} ₽</span></div>
       <div class="row" style="margin-top:10px">
         <input type="number" min="0" step="10" value="${g.limit}" data-limit style="flex:1;min-width:90px" aria-label="Лимит, ₽">
         <button type="button" class="btn small secondary" data-act="limit">Лимит</button>

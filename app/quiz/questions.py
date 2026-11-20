@@ -10,6 +10,11 @@
     order   порядок шагов  options: {"items": [...]} (правильный порядок; на экране перемешиваем)
                                                           answer: {"order": [...]}
     fill    вставить слово текст с «___»; options: []     answer: {"accepted": ["слово", "синоним"]}
+
+Пояснение (explain, JSON): {"why": почему верный ответ верен, "trap": почему ловушка неверна,
+"remember": что запомнить, "answer_text": правильный ответ словами — по нему код ловит противоречия}.
+verified = False — ИИ дважды прислал противоречие (ответ не сходится с пояснением): вопрос
+помечается «не проверено» и в баллы не идёт.
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ import hashlib
 import random
 import re
 
+from app import config
 from app.ai import to_number
 from app.quiz.material import QuoteIndex, norm_for_match
 
@@ -27,9 +33,23 @@ TYPE_NAMES = {
 }
 # Баллы за вопрос по виду. Меняй здесь.
 POINTS = {"single": 1, "tf": 1, "fill": 1, "multi": 2, "match": 2, "order": 2, "open": 2}
-# Доли видов вопросов в квизе (примерно; ИИ может отступить, если материал не подходит).
-TYPE_SHARE = {"single": 0.30, "multi": 0.15, "tf": 0.15, "open": 0.10, "match": 0.10, "order": 0.08, "fill": 0.12}
-DIFFICULTIES = {"easy": "лёгкий", "medium": "средний", "hard": "на размышление"}
+# Доли видов вопросов и всё остальное про уровни — в app/config.py → LEVELS.
+DIFFICULTIES = {k: v["name"] for k, v in config.LEVELS.items()}
+CONTRADICTION = "противоречие: ответ не сходится с пояснением"
+
+
+def level(difficulty: str | None) -> dict:
+    return config.LEVELS.get(difficulty or "", config.LEVELS[config.LEVEL_DEFAULT])
+
+
+def hint_mode(difficulty: str | None, hints_on: bool) -> str:
+    """all | outside | none — у каких вопросов будут подсказки (решает уровень, выключатель в форме — тоже)."""
+    return level(difficulty)["hints"] if hints_on else "none"
+
+
+def points_for(qtype: str, difficulty: str | None) -> float:
+    """Баллы за вопрос: за вид (POINTS) × множитель уровня."""
+    return round(float(POINTS.get(qtype, 1)) * float(level(difficulty)["multiplier"]), 2)
 FLAGS = {"": "", "outside": "вне файла", "logic": "на логику"}
 
 _TYPE_SYN = {
@@ -63,14 +83,16 @@ def _get(d: dict, *names, default=None):
     return default
 
 
-def type_plan(n: int, allowed: list[str] | None = None) -> dict[str, int]:
-    """Сколько вопросов каждого вида просить у ИИ."""
-    allowed = [t for t in (allowed or TYPES) if t in TYPE_SHARE]
-    shares = {t: TYPE_SHARE[t] for t in allowed}
-    s = sum(shares.values())
+def type_plan(n: int, difficulty: str | None = None, allowed: list[str] | None = None) -> dict[str, int]:
+    """Сколько вопросов каждого вида просить у ИИ — по долям уровня (config.LEVELS[...]["types"]).
+    Делим «по остаткам», поэтому сумма всегда ровно n и результат одинаковый при каждом вызове."""
+    share = level(difficulty)["types"]
+    allowed = [t for t in (allowed or TYPES) if share.get(t)]
+    shares = {t: share[t] for t in allowed}
+    s = sum(shares.values()) or 1
     raw = {t: n * v / s for t, v in shares.items()}
     plan = {t: int(v) for t, v in raw.items()}
-    for t in sorted(raw, key=lambda t: raw[t] - plan[t], reverse=True)[: n - sum(plan.values())]:
+    for t in sorted(raw, key=lambda t: (raw[t] - plan[t], shares[t]), reverse=True)[: n - sum(plan.values())]:
         plan[t] += 1
     return {t: c for t, c in plan.items() if c}
 
@@ -142,10 +164,12 @@ def normalize(raw: dict, defaults: dict | None = None) -> dict:
                            _DIFF_SYN, d.get("difficulty", "medium")),
         "flag": _syn(_get(raw, "flag", "mark", "пометка", "tag", "label", default=""), _FLAG_SYN, ""),
         "text": str(_get(raw, "text", "question", "вопрос", "prompt", "stem", default="") or "").strip(),
-        "explanation": str(_get(raw, "explanation", "explain", "объяснение", "пояснение", "rationale", default="") or "").strip(),
+        "explanation": "",
         "quote": str(_get(raw, "quote", "citation", "цитата", "source_quote", "evidence", default="") or "").strip().strip("«»\"“”"),
         "hint": str(_get(raw, "hint", "подсказка", "clue", default="") or "").strip(),
     }
+    q["explain"] = _explain(raw)
+    q["explanation"] = explain_text(q["explain"])
     t = q["qtype"]
     opts_raw = _get(raw, "options", "variants", "choices", "варианты", "answers_options", default=[])
     correct_raw = _get(raw, "correct", "correct_answer", "correct_answers", "correct_index", "correct_indices",
@@ -223,6 +247,104 @@ def normalize(raw: dict, defaults: dict | None = None) -> dict:
     return q
 
 
+_EXPL_FIELDS = {
+    "why": ("why", "why_right", "why_correct", "почему_верно", "почему", "reason"),
+    "trap": ("trap", "why_wrong", "distractor", "ловушка", "почему_неверно", "почему_ловушка_неверна"),
+    "remember": ("remember", "takeaway", "key_idea", "запомни", "что_запомнить", "запомнить"),
+}
+
+
+def _explain(raw: dict) -> dict:
+    """Пояснение ИИ → {why, trap, remember, answer_text}. Понимает и строку, и объект, и поля сверху."""
+    ex = _get(raw, "explain", "explanation", "объяснение", "пояснение", "rationale", default="")
+    src = dict(raw)
+    if isinstance(ex, dict):
+        src.update(ex)
+        ex = ""
+    out = {k: str(_get(src, *names, default="") or "").strip() for k, names in _EXPL_FIELDS.items()}
+    if not out["why"] and ex:
+        out["why"] = str(ex).strip()
+    at = _get(src, "answer_text", "correct_text", "right_answer_text", "ответ_словами", "правильный_ответ_словами", default="")
+    if isinstance(at, list):
+        at = "; ".join(str(x) for x in at if x)
+    out["answer_text"] = str(at or "").strip()
+    return out
+
+
+def explain_text(ex: dict) -> str:
+    """Пояснение одной строкой (для старых экранов и для поиска)."""
+    parts = [ex.get("why", "")]
+    if ex.get("trap"):
+        parts.append("Ловушка: " + ex["trap"])
+    if ex.get("remember"):
+        parts.append("Запомни: " + ex["remember"])
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+def _close(a: str, b: str) -> float:
+    """Насколько похожи два коротких текста (0..1): равны, один внутри другого, общие слова."""
+    na, nb = norm_for_match(a), norm_for_match(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    if f" {na} " in f" {nb} " or f" {nb} " in f" {na} ":
+        return 0.85
+    wa, wb = set(na.split()), set(nb.split())
+    return len(wa & wb) / len(wa | wb)
+
+
+def _mentions(text: str, option: str) -> bool:
+    """Вариант ответа целиком встречается в тексте (для вариантов от 2 слов или от 6 букв)."""
+    no, nt = norm_for_match(option), norm_for_match(text)
+    if not no or (len(no.split()) < 2 and len(no) < 6):
+        return False
+    return f" {no} " in f" {nt} "
+
+
+def contradiction(q: dict) -> str:
+    """Код сверяет правильный ответ с пояснением. Пустая строка — противоречий не видно.
+    Сверяем «ответ словами» (answer_text) с отмеченным вариантом и то, какой вариант
+    назван в «почему верно». Если данных для сверки нет — противоречием это не считаем."""
+    t = q.get("qtype")
+    ex = q.get("explain") or {}
+    at = ex.get("answer_text", "")
+    a = q.get("answer") or {}
+    opts = q.get("options") or []
+    if t == "single" and len(opts) >= 2 and a.get("correct"):
+        c = a["correct"][0]
+        if at:
+            sc = [_close(at, o) for o in opts]
+            best = max(range(len(opts)), key=lambda i: sc[i])
+            if sc[best] >= 0.5 and best != c and sc[best] > sc[c] + 0.15:
+                return f"ответ отмечен «{opts[c]}», а в пояснении — «{opts[best]}»"
+        why = ex.get("why", "")
+        named = [i for i, o in enumerate(opts) if _mentions(why, o)]
+        if len(named) == 1 and named[0] != c and not _mentions(why, opts[c]):
+            return f"в пояснении верным назван «{opts[named[0]]}», а отмечен «{opts[c]}»"
+    elif t == "multi" and at and opts:
+        items = [x for x in re.split(r";|\n", at) if x.strip()]
+        picked = set()
+        for it in items:
+            sc = [_close(it, o) for o in opts]
+            best = max(range(len(opts)), key=lambda i: sc[i])
+            if sc[best] >= 0.5:
+                picked.add(best)
+        if picked and not picked <= set(a.get("correct", [])):
+            return "в пояснении верными названы другие варианты"
+    elif t == "tf" and at and a.get("value") is not None:
+        low = norm_for_match(at)
+        said = (False if re.match(r"(неверно|ложь|нет|false|не верно)\b", low)
+                else True if re.match(r"(верно|правда|да|true|истина)\b", low) else None)
+        if said is not None and said != a["value"]:
+            return "в пояснении сказано «" + ("верно" if said else "неверно") + "», а отмечено обратное"
+    elif t == "fill" and at and a.get("accepted"):
+        from app.quiz.scoring import fill_ok
+        if not fill_ok(at, a["accepted"]) and max(_close(at, x) for x in a["accepted"]) < 0.5:
+            return f"в пояснении правильное слово «{at}», а принимается «{a['accepted'][0]}»"
+    return ""
+
+
 def problems(q: dict, quotes: QuoteIndex | None) -> list[str]:
     """Что не так с вопросом. Пустой список — вопрос годится.
     Отдельная проблема "quote" — цитаты нет в тексте."""
@@ -267,9 +389,11 @@ def problems(q: dict, quotes: QuoteIndex | None) -> list[str]:
             p.append("в тексте должен быть ровно один пропуск ___")
         if not a.get("accepted"):
             p.append("нет правильного слова")
+    if contradiction(q):
+        p.append(CONTRADICTION)
     if quotes is not None:
         if q.get("quote"):
-            if not quotes.contains(q["quote"]):
+            if not quotes.contains(q["quote"]) and q.get("flag") != "outside":
                 p.append("quote")
         elif q.get("flag") != "outside":
             p.append("quote")
@@ -280,8 +404,26 @@ def fingerprint(text: str) -> set[str]:
     return {w for w in norm_for_match(text).split() if len(w) > 2}
 
 
+def question_key(qtype: str, text: str, options) -> str:
+    """Текст для сравнения вопросов «похож или нет». У соответствий и порядка формулировка часто одна
+    («Расставь по порядку…»), а разница — в пунктах, поэтому пункты добавляем к тексту."""
+    if qtype == "match" and isinstance(options, dict):
+        return f"{text} " + " ".join(options.get("left", []))
+    if qtype == "order" and isinstance(options, dict):
+        return f"{text} " + " ".join(options.get("items", []))
+    return text
+
+
+def key_of(q) -> str:
+    """question_key для вопроса-словаря или строки базы."""
+    from app.db import loads
+    if isinstance(q, dict):
+        return question_key(q.get("qtype", ""), q.get("text", ""), q.get("options"))
+    return question_key(q.qtype, q.text, loads(q.options, []))
+
+
 def is_duplicate(text: str, others: list[str], threshold: float = 0.8) -> bool:
-    """Похожий вопрос уже есть? (совпадение слов ≥ 80 %)"""
+    """Похожий вопрос уже есть? (совпадение слов ≥ threshold, по умолчанию 80 %)"""
     a = fingerprint(text)
     if not a:
         return False
@@ -294,10 +436,58 @@ def is_duplicate(text: str, others: list[str], threshold: float = 0.8) -> bool:
     return False
 
 
-def finalize(q: dict, hints_on: bool) -> dict:
-    """Последние правки перед сохранением: перемешать варианты, убрать лишние подсказки."""
-    if not hints_on or q.get("flag") not in ("outside", "logic"):
+def code_hint(q: dict) -> str:
+    """Подсказка без ИИ (запасной вариант): наводит, но ответ не выдаёт."""
+    t, a, o = q.get("qtype"), q.get("answer") or {}, q.get("options") or []
+    try:
+        if t == "single":
+            wrong = [x for i, x in enumerate(o) if i not in a.get("correct", [])]
+            return f"Точно не «{wrong[len(q.get('text', '')) % len(wrong)]}»." if wrong else ""
+        if t == "multi":
+            return f"Верных вариантов здесь {len(a.get('correct', []))}."
+        if t == "tf":
+            return "Сверь утверждение с материалом: подвох обычно в одном слове."
+        if t == "fill":
+            w = (a.get("accepted") or [""])[0]
+            return f"Слово начинается на «{w[:1]}», в нём {len(w)} букв." if w else ""
+        if t == "match":
+            pairs = a.get("pairs") or []
+            return f"Одна пара: «{pairs[0][0]}» → «{pairs[0][1]}»." if pairs else ""
+        if t == "order":
+            items = a.get("order") or []
+            return f"Первый шаг: «{items[0]}»." if items else ""
+        if t == "open":
+            kp = a.get("key_points") or []
+            return f"Начни с мысли: {' '.join(str(kp[0]).split()[:4])}…" if kp else "Ответь 1–3 предложениями: что это и почему."
+    except (IndexError, KeyError, TypeError, ZeroDivisionError):
+        pass
+    return ""
+
+
+def _hint_gives_answer(q: dict) -> bool:
+    h = q.get("hint", "")
+    a = q.get("answer") or {}
+    if q.get("qtype") in ("single", "multi"):
+        return any(_mentions(h, q["options"][i]) for i in a.get("correct", []) if i < len(q.get("options", [])))
+    if q.get("qtype") == "fill":
+        return any(norm_for_match(x) and norm_for_match(x) in norm_for_match(h).split() for x in a.get("accepted", []))
+    return False
+
+
+def finalize(q: dict, hints: str | bool, difficulty: str | None = None) -> dict:
+    """Последние правки перед сохранением (всё кодом):
+    - подсказки по режиму уровня: all — у всех, outside — только «вне файла», none — нет;
+      если ИИ подсказку не дал или она выдаёт ответ — подсказка от кода;
+    - у вопросов «шире файла» цитаты нет (чтобы не ссылаться на то, чего в файле нет);
+    - варианты перемешиваются; баллы = вид × множитель уровня."""
+    mode = hints if isinstance(hints, str) else ("outside" if hints else "none")
+    need = mode == "all" or (mode == "outside" and q.get("flag") == "outside")
+    if not need:
         q["hint"] = ""
+    elif not q.get("hint") or _hint_gives_answer(q):
+        q["hint"] = code_hint(q)
+    if q.get("flag") == "outside":
+        q["quote"] = ""
     if q["qtype"] in ("single", "multi"):
         # ИИ любит ставить правильный ответ первым — перемешиваем (одинаково при каждом сохранении).
         seed = int(hashlib.md5(q["text"].encode()).hexdigest()[:8], 16)
@@ -307,7 +497,8 @@ def finalize(q: dict, hints_on: bool) -> dict:
         correct = set(q["answer"]["correct"])
         q["options"] = [q["options"][i] for i in idx]
         q["answer"] = {"correct": sorted(n for n, i in enumerate(idx) if i in correct)}
-    q["points"] = float(POINTS.get(q["qtype"], 1))
+    q["points"] = points_for(q["qtype"], difficulty or q.get("difficulty"))
+    q.setdefault("verified", True)
     return q
 
 
@@ -321,6 +512,7 @@ def public(question, with_answer: bool = False) -> dict:
         "qtype": question.qtype, "type_name": TYPE_NAMES.get(question.qtype, ""), "difficulty": question.difficulty,
         "flag": question.flag or "", "flag_name": FLAGS.get(question.flag or "", ""), "text": question.text,
         "points": question.points, "hint": question.hint or "", "replace_count": question.replace_count or 0,
+        "verified": question.verified is not False,
     }
     if question.qtype == "match":
         rnd = random.Random(question.id)
@@ -340,6 +532,7 @@ def public(question, with_answer: bool = False) -> dict:
     if with_answer:
         out["answer"] = loads(question.answer, {})
         out["explanation"] = question.explanation or ""
+        out["explain"] = loads(question.explain, {}) or {}
         out["quote"] = question.quote or ""
         out["correct_options"] = opts
     return out
@@ -351,5 +544,6 @@ def snapshot(question) -> dict:
 
     return {"text": question.text, "qtype": question.qtype, "options": loads(question.options, []),
             "answer": loads(question.answer, {}), "explanation": question.explanation or "",
+            "explain": loads(question.explain, {}) or {}, "verified": question.verified is not False,
             "quote": question.quote or "", "topic": question.topic, "subtopic": question.subtopic,
             "points": question.points, "flag": question.flag or "", "difficulty": question.difficulty}

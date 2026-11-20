@@ -13,8 +13,7 @@ from app.ai.base import AIError
 from app.db import (OWNER_ID, Answer, Attempt, Question, Quiz, QuizText, SessionLocal, Setting, Subject,
                     UploadPart, Usage, dumps, loads, new_id, now)
 from app.quiz import attempts, pipeline
-from app.quiz.material import (MaterialError, apply_range, combine, estimate_tokens, extract_file, fetch_url,
-                               norm_subject)
+from app.quiz.material import MaterialError, apply_range, combine, estimate_tokens, extract_file, fetch_url
 
 router = APIRouter(prefix="/api")
 User = Depends(auth.current_user)
@@ -73,7 +72,9 @@ def bootstrap(user_id: str = User):
             "limits": {"max_files": config.MAX_FILES, "max_file_mb": config.MAX_FILE_MB,
                        "part_bytes": config.UPLOAD_PART_BYTES, "max_urls": config.MAX_URLS,
                        "choices": config.QUESTION_CHOICES, "max_questions": config.MAX_QUESTIONS,
-                       "timer": config.TIMER_SECONDS, "max_replaces": config.MAX_REPLACES}}
+                       "timer": config.TIMER_SECONDS, "max_replaces": config.MAX_REPLACES,
+                       "levels": {k: attempts.level_info(k) for k in config.LEVELS},
+                       "retry_share": config.RETRY_MISTAKES_SHARE}}
 
 
 # --- Загрузка файлов кусками ---------------------------------------------------------
@@ -141,7 +142,7 @@ def create_quiz(body: QuizIn, user_id: str = User):
         raise HTTPException(400, "Впиши тему квиза")
     if not 1 <= body.count <= config.MAX_QUESTIONS:
         raise HTTPException(400, f"Число вопросов — от 1 до {config.MAX_QUESTIONS}")
-    if body.difficulty not in config.TIMER_SECONDS:
+    if body.difficulty not in config.LEVELS:
         raise HTTPException(400, "Неизвестная сложность")
     if len(body.uploads) > config.MAX_FILES:
         raise HTTPException(400, f"Не больше {config.MAX_FILES} файлов")
@@ -200,7 +201,7 @@ def generate(quiz_id: str, user_id: str = User):
     try:
         return pipeline.generate(quiz_id)
     except AIError as e:
-        raise HTTPException(502, str(e)) from e
+        raise HTTPException(503, f"ИИ недоступен: {e}") from e
     except (pipeline.QuizError, MaterialError) as e:
         _err(e)
 
@@ -323,9 +324,35 @@ def review(attempt_id: str, user_id: str = User):
     try:
         return pipeline.review_attempt(attempt_id)
     except AIError as e:
-        raise HTTPException(502, str(e)) from e
+        raise HTTPException(503, f"ИИ недоступен: {e}") from e
     except pipeline.QuizError as e:
         _err(e)
+
+
+class RetryIn(BaseModel):
+    count: int | None = None
+    difficulty: str | None = None
+    timer: bool | None = None
+    hints: bool | None = None
+    use_mistakes: bool = True
+
+
+@router.post("/attempts/{attempt_id}/retry")
+def retry_topic(attempt_id: str, body: RetryIn, user_id: str = User):
+    """«Пройти тему ещё раз»: новый квиз по тому же тексту и диапазону, с новыми вопросами
+    (часть — из ошибок этой попытки). Старый квиз не меняется. Вопросы — потом, через /generate."""
+    _own("attempt", attempt_id, user_id)
+    if body.count is not None and not 1 <= body.count <= config.MAX_QUESTIONS:
+        raise HTTPException(400, f"Число вопросов — от 1 до {config.MAX_QUESTIONS}")
+    if body.difficulty is not None and body.difficulty not in config.LEVELS:
+        raise HTTPException(400, "Неизвестная сложность")
+    try:
+        out = pipeline.create_retry(attempt_id, body.model_dump(exclude_none=True), user_id)
+    except pipeline.QuizError as e:
+        _err(e)
+    store.put("form", user_id=user_id, value={**(store.get("form", user_id=user_id) or {}),
+                                              **body.model_dump(exclude_none=True, exclude={"use_mistakes"})})
+    return out
 
 
 @router.post("/questions/{question_id}/replace")
@@ -334,7 +361,7 @@ def replace(question_id: str, user_id: str = User):
     try:
         return pipeline.replace_question(question_id)
     except AIError as e:
-        raise HTTPException(502, str(e)) from e
+        raise HTTPException(503, f"ИИ недоступен: {e}") from e
     except pipeline.QuizError as e:
         _err(e)
 
@@ -360,7 +387,7 @@ def subject(subject_id: str, user_id: str = User):
         _err(e, 404)
 
 
-class SubjectQuizIn(BaseModel):
+class SubjectQuizIn(BaseModel):  # noqa: D101
     count: int = 10
     difficulty: str = "medium"
     timer: bool = False
@@ -372,6 +399,8 @@ def subject_quiz(subject_id: str, body: SubjectQuizIn, user_id: str = User):
     _own("subject", subject_id, user_id)
     if not 1 <= body.count <= config.MAX_QUESTIONS:
         raise HTTPException(400, f"Число вопросов — от 1 до {config.MAX_QUESTIONS}")
+    if body.difficulty not in config.LEVELS:
+        raise HTTPException(400, "Неизвестная сложность")
     try:
         qid = pipeline.create_subject_quiz(subject_id, body.model_dump(), user_id)
     except pipeline.QuizError as e:
@@ -501,11 +530,6 @@ def question(question_id: str, user_id: str = User):
         if q is None:
             raise HTTPException(404, "Вопрос не найден")
         return public(q)
-
-
-def subject_by_name(name: str):
-    with SessionLocal() as s:
-        return s.scalars(sa.select(Subject).where(Subject.norm == norm_subject(name))).first()
 
 
 # --- Тестеры (только владелец) ------------------------------------------------------
