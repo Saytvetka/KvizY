@@ -97,8 +97,8 @@ jobs:
           docker run -d --name smoke -p 8080:8080 -e KVIZY_PASSWORD=x -e SESSION_SECRET=x -e KEY_SECRET=x -e AI_PROVIDER=mock "$IMAGE"
           for i in 1 2 3 4 5 6 7 8 9 10; do
             code=$(curl -s -o body.txt -w "%{http_code}" http://localhost:8080/api/health || true)
-            echo "Попытка $i: HTTP $code"; cat body.txt 2>/dev/null; echo
-            [ "$code" = "200" ] && { docker rm -f smoke >/dev/null; exit 0; }
+            echo "Попытка $i: HTTP $code"; cat body.txt 2>/dev/null || true; echo
+            if [ "$code" = "200" ]; then docker rm -f smoke >/dev/null; exit 0; fi
             sleep 2
           done
           docker logs smoke; docker rm -f smoke >/dev/null
@@ -143,7 +143,7 @@ jobs:
           URL=$(yc serverless container get --name kvizy --format json | python3 -c "import json,sys; print(json.load(sys.stdin)['url'])")
           for i in 1 2 3 4 5 6; do
             code=$(curl -s -m 60 -o body.txt -w "%{http_code}" "${URL%/}/api/health" || true)
-            echo "Попытка $i: HTTP $code"; cat body.txt 2>/dev/null; echo
+            echo "Попытка $i: HTTP $code"; cat body.txt 2>/dev/null || true; echo
             if [ "$code" = "200" ]; then exit 0; fi
             sleep 10
           done
