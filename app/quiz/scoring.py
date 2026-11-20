@@ -25,17 +25,40 @@ def _lev(a: str, b: str, limit: int = 3) -> int:
     return prev[-1]
 
 
+_stemmer = None
+
+
+def stem(word: str) -> str:
+    """Основа слова без окончания: «электролизом», «электролиза» → «электролиз»; «солью», «соли» → «сол».
+    Snowball для русского; латиница и числа не меняются."""
+    global _stemmer
+    if _stemmer is None:
+        import snowballstemmer
+        _stemmer = snowballstemmer.stemmer("russian")
+    return _stemmer.stemWord(word) if re.search(r"[а-я]", word) else word
+
+
+def _word_ok(g: str, n: str) -> bool:
+    """Одно слово ответа против одного правильного: точно, другое окончание (падеж, число) или опечатка."""
+    if g == n:
+        return True
+    gs, ns = stem(g), stem(n)
+    if gs == ns and len(ns) >= 2:
+        return True
+    # допускаем опечатку: 1 буква в словах от 5 букв, 2 — от 9 (сравниваем и слова, и основы)
+    allowed = 2 if len(n) >= 9 else 1 if len(n) >= 5 else 0
+    return bool(allowed) and (_lev(g, n, allowed) <= allowed or _lev(gs, ns, allowed) <= allowed)
+
+
 def fill_ok(given: str, accepted: list[str]) -> bool:
-    g = norm_for_match(given)
+    """Засчитываем «вставить пропущенное», если каждое слово совпало с правильным с точностью до
+    окончания (любой падеж, число) или одной опечатки. Порядок слов тот же, число слов то же."""
+    g = norm_for_match(given).split()
     if not g:
         return False
     for a in accepted:
-        n = norm_for_match(a)
-        if g == n:
-            return True
-        # допускаем опечатку: 1 буква в словах от 5 букв, 2 — от 9
-        allowed = 2 if len(n) >= 9 else 1 if len(n) >= 5 else 0
-        if allowed and _lev(g, n, allowed) <= allowed:
+        n = norm_for_match(a).split()
+        if len(n) == len(g) and all(_word_ok(x, y) for x, y in zip(g, n)):
             return True
     return False
 

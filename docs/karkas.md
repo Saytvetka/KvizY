@@ -174,7 +174,7 @@ Dockerfile  .github/workflows/deploy.yml  requirements.txt  .env.example
 | open — своими словами | ИИ: 0 / ½ / 1 | 2 |
 | match — соответствие | код, доля верных пар | 2 |
 | order — порядок шагов | код, доля шагов на своём месте | 2 |
-| fill — вставить пропущенное | код, допускает 1 опечатку в словах от 5 букв | 1 |
+| fill — вставить пропущенное | код: любой падеж и число (сравнивается основа слова, snowball), 1 опечатка в словах от 5 букв | 1 |
 
 Баллы в таблице умножаются на множитель уровня (×1 / ×1,5 / ×2).
 
@@ -247,7 +247,7 @@ Dockerfile  .github/workflows/deploy.yml  requirements.txt  .env.example
 | проверку «ответ сходится с пояснением» | `app/quiz/questions.py` → `contradiction` |
 | как ИИ разбирает ошибки | `app/quiz/prompts.py` → `review_prompt` |
 | как ИИ пишет вопросы, проверяет ответы | `app/quiz/prompts.py`; общие правила — `SYSTEM_RULES` в `app/ai/__init__.py` |
-| допуск опечаток в «вставить слово» | `app/quiz/scoring.py` → `fill_ok` |
+| допуск опечаток и падежей в «вставить слово» | `app/quiz/scoring.py` → `fill_ok`, `_word_ok` |
 | частичные баллы | `app/quiz/scoring.py` → `grade` |
 | цены ИИ по умолчанию | `PRICES` / `USD` в `app/ai/yandex.py`, `gigachat.py`, `claude.py` (или в Настройках приложения) |
 | список моделей в Настройках | `app/store.py` → `PROVIDERS` |
