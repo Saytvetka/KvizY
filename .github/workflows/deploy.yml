@@ -6,6 +6,10 @@ name: deploy
 on:
   push:
     branches: [main]
+    # BiletY (папка bilety/) деплоится своим файлом bilety.yml и KvizY не трогает.
+    paths-ignore:
+      - "bilety/**"
+      - ".github/workflows/bilety.yml"
   workflow_dispatch:
 
 concurrency:
