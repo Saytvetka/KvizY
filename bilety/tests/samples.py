@@ -20,16 +20,34 @@ LECTURE_2 = """Коррозия металлов
 """
 
 
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+LECTURE_EN = """Electrolysis
+
+Electrolysis is a redox process that takes place on electrodes when current passes through a solution or melt.
+Reduction happens at the cathode and oxidation happens at the anode.
+Faraday laws link the mass of a substance on the electrode with the amount of electricity.
+"""
+
+
 def pdf_bytes(text: str = LECTURE_1) -> bytes:
+    """PDF с текстом. В лёгком образе контейнера нет шрифта с кириллицей — тогда текст английский
+    (сам разбор PDF с русским текстом проверяется в первом шаге CI, где шрифт есть)."""
+    import os
+
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.pdfgen import canvas
 
-    pdfmetrics.registerFont(TTFont("DV", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+    font = "Helvetica"
+    if os.path.exists(FONT):
+        pdfmetrics.registerFont(TTFont("DV", FONT))
+        font = "DV"
+    else:
+        text = LECTURE_EN
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    c.setFont("DV", 11)
+    c.setFont(font, 11)
     y = 800
     for line in text.split("\n"):
         while len(line) > 90:
