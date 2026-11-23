@@ -79,3 +79,20 @@ def test_browser_pbkdf2_hash_accepted():
     stored = f"pbkdf2_sha256$600000${salt.hex()}${h}"
     assert verify_hash("мой-пароль", stored) and not verify_hash("чужой", stored)
     assert not verify_hash("мой-пароль", f"pbkdf2_sha256$10${salt.hex()}${h}")  # слишком мало итераций
+
+
+def test_ydb_url_tolerates_copied_tails():
+    """Секреты базы, скопированные «с хвостами», всё равно дают правильный адрес."""
+    from app.config import ydb_url
+    good = "grpcs://ydb.serverless.yandexcloud.net:2135/?database=/ru-central1/b1g/etn"
+    db = "/ru-central1/b1g/etn"
+    for ep, d in [("grpcs://ydb.serverless.yandexcloud.net:2135", db),
+                  ("grpcs://ydb.serverless.yandexcloud.net:2135/", db),
+                  ("grpcs://ydb.serverless.yandexcloud.net:2135database=", db),
+                  ("grpcs://ydb.serverless.yandexcloud.net:2135/?database=", db),
+                  ("grpcs://ydb.serverless.yandexcloud.net:2135/?database=/ru-central1/b1g/etn", ""),
+                  ("grpcs://ydb.serverless.yandexcloud.net:2135", "database=/ru-central1/b1g/etn"),
+                  ("grpcs://ydb.serverless.yandexcloud.net:2135", "ru-central1/b1g/etn/"),
+                  ("grpcs://ydb.serverless.yandexcloud.net", db)]:
+        assert ydb_url(ep, d) == good, (ep, d)
+    assert ydb_url("", db) == ""

@@ -86,6 +86,28 @@ OCR_PRICE_RUB = 0.13
 JOB_STALE_SECONDS = 120
 
 
+def ydb_url(endpoint: str, database: str) -> str:
+    """Адрес YDB из двух секретов, даже если их скопировали «с хвостами»:
+    эндпоинт целиком с ?database=…, без порта, с лишними / или «database=» в имени базы."""
+    import re
+
+    endpoint = re.sub(r"\s+", "", endpoint or "")
+    database = re.sub(r"\s+", "", database or "")
+    if not endpoint:
+        return ""
+    m = re.match(r"(grpcs?)://([^/:?]+)(?::(\d+))?", endpoint)
+    if not m:
+        return endpoint
+    scheme, host, port = m.group(1), m.group(2), m.group(3) or "2135"
+    if not database:  # имя базы могло остаться в самом эндпоинте
+        database = (re.search(r"database=(\S+)", endpoint) or [None, ""])[1]
+    database = database.split("database=")[-1]
+    if "/ru-central1" in database:
+        database = database[database.index("/ru-central1"):]
+    database = "/" + database.strip("/")
+    return f"{scheme}://{host}:{port}/?database={database}"
+
+
 @dataclass
 class Settings:
     # Пароль: хэш (scripts/hash_password.py) — так он нигде не лежит открытым текстом.
@@ -100,8 +122,7 @@ class Settings:
 
     # База: пусто = локальный файл SQLite; адрес YDB (grpcs://...?database=...) = YDB.
     # Вместо DATABASE_URL можно задать YDB_ENDPOINT и YDB_DATABASE.
-    database_url: str = field(default_factory=lambda: _env("DATABASE_URL") or (
-        f"{_env('YDB_ENDPOINT').rstrip('/')}/?database={_env('YDB_DATABASE')}" if _env("YDB_ENDPOINT") else ""))
+    database_url: str = field(default_factory=lambda: _env("DATABASE_URL") or ydb_url(_env("YDB_ENDPOINT"), _env("YDB_DATABASE")))
 
     monthly_budget: float = field(default_factory=lambda: _float("MONTHLY_BUDGET_RUB", 500))
 
