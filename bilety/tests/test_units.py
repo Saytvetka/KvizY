@@ -67,3 +67,15 @@ def test_range_and_split():
     assert "Коррозия" in cut and "Электролиз —" not in cut and note
     parts = split_text(samples.LECTURE_1 * 50, 1000)
     assert len(parts) > 1 and all(len(p) <= 1000 * 3.2 + 10 for p in parts)
+
+
+def test_browser_pbkdf2_hash_accepted():
+    """Хэш со страницы-генератора (PBKDF2-SHA256 из WebCrypto) подходит для входа."""
+    import hashlib
+
+    from app.auth import verify_hash
+    salt = bytes.fromhex("00112233445566778899aabbccddeeff")
+    h = hashlib.pbkdf2_hmac("sha256", "мой-пароль".encode(), salt, 600_000).hex()
+    stored = f"pbkdf2_sha256$600000${salt.hex()}${h}"
+    assert verify_hash("мой-пароль", stored) and not verify_hash("чужой", stored)
+    assert not verify_hash("мой-пароль", f"pbkdf2_sha256$10${salt.hex()}${h}")  # слишком мало итераций

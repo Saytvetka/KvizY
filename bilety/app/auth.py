@@ -41,10 +41,20 @@ def hash_password(pw: str) -> str:
 
 
 def verify_hash(pw: str, stored: str) -> bool:
+    """Два вида хэша:
+    - scrypt$соль$хэш — делает scripts/hash_password.py и смена пароля в Настройках;
+    - pbkdf2_sha256$итерации$соль$хэш — делает страница-генератор прямо в браузере (WebCrypto умеет только PBKDF2)."""
     try:
-        _, salt, h = stored.strip().split("$")
-        calc = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1)
-        return hmac.compare_digest(calc.hex(), h)
+        parts = stored.strip().split("$")
+        if parts[0] == "pbkdf2_sha256":
+            _, iters, salt, h = parts
+            if int(iters) < 100_000:
+                return False
+            calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(iters))
+        else:
+            _, salt, h = parts
+            calc = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1)
+        return hmac.compare_digest(calc.hex(), h.lower())
     except Exception:
         return False
 
