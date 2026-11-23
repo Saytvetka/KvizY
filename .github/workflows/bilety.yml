@@ -60,6 +60,14 @@ jobs:
             echo "skip=1" >> $GITHUB_OUTPUT; exit 0
           fi
           if [ -n "$missing" ]; then echo "::error::Не заданы секреты:$missing (см. bilety/docs/yandex_cloud.md)"; exit 1; fi
+          # Переменные контейнеру передаются строкой «A=1,B=2»: запятая или кавычка внутри значения её ломает.
+          # Печатаем только ИМЯ секрета, значение — никогда.
+          bad=""
+          for v in "E:BILETY_PASSWORD_HASH" "F:BILETY_SESSION_SECRET" "G:BILETY_KEY_SECRET" "H:BILETY_YDB_ENDPOINT" "I:BILETY_YDB_DATABASE"; do
+            var="${v%%:*}"
+            case "${!var}" in *,*|*\"*|*\'*) bad="$bad ${v#*:}";; esac
+          done
+          if [ -n "$bad" ]; then echo "::error::В секретах есть запятая или кавычка:$bad. Замени значение на латинские буквы и цифры без запятых."; exit 1; fi
 
       - name: Подготовить значения (убрать лишние пробелы и переносы строк из секретов)
         if: steps.check.outputs.skip != '1'
