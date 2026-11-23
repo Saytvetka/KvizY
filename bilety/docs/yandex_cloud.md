@@ -33,7 +33,7 @@ YandexGPT картинки не читает, фото и сканы читае�
 
 ## Шаг 4. Секреты в GitHub
 
-Открой https://github.com/8hwbn2nfvy-dotcom/KvizY/settings/secrets/actions → «New repository secret». Секреты KvizY (`YC_SA_JSON_CREDENTIALS`, `YC_FOLDER_ID`, `YC_SA_ID`, `YC_REGISTRY_ID`) уже есть и подходят. Добавь:
+Открой https://github.com/Saytvetka/KvizY/settings/secrets/actions → «New repository secret». Секреты KvizY (`YC_SA_JSON_CREDENTIALS`, `YC_FOLDER_ID`, `YC_SA_ID`, `YC_REGISTRY_ID`) уже есть и подходят. Добавь:
 
 | Имя | Что вписать |
 |---|---|
@@ -50,7 +50,7 @@ YandexGPT картинки не читает, фото и сканы читае�
 
 ## Шаг 5. Первый запуск
 
-1. Открой https://github.com/8hwbn2nfvy-dotcom/KvizY/actions/workflows/bilety.yml → «Run workflow».
+1. Открой https://github.com/Saytvetka/KvizY/actions/workflows/bilety.yml → «Run workflow».
 2. Через 3–5 минут в шаге «Новая ревизия контейнера» будет **«Адрес приложения:»** `https://bba….containers.yandexcloud.net/` — это адрес BiletY.
 3. Контейнер `bilety` → «Обзор» → включи **«Публичный контейнер»** (один раз, как у KvizY). Без этого — «403 Forbidden».
 
