@@ -88,9 +88,9 @@ def questions(text: str, counts: dict[str, int], shift: int = 0) -> dict:
             if qtype == "tf":
                 q.update(text=f"Верно ли: «{_short(s, 14)}»?", options=["Верно", "Неверно"], correct=0)
             elif qtype == "multi":
-                q.update(text=f"Что из этого есть в материале? (вопрос {i + 1})", options=opts[:5], correct=[0, 1])
+                q.update(text=f"Что из этого есть в материале? ({_short(s, 4)})", options=opts[:5], correct=[0, 1])
             else:
-                q.update(text=f"Какое утверждение из материала? (вопрос {i + 1})", options=opts[:4], correct=0)
+                q.update(text=f"Какое утверждение из материала? ({_short(s, 4)})", options=opts[:4], correct=0)
             out.append(q)
             i += 1
     return {"topics": [t for t, _ in secs], "questions": out}

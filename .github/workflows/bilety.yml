@@ -55,8 +55,8 @@ jobs:
             var="${v%%:*}"
             [ -z "${!var}" ] && missing="$missing ${v#*:}"
           done
-          if [ -z "$A" ]; then
-            echo "::warning::Деплой пропущен: Yandex Cloud ещё не настроен (нет секрета YC_SA_JSON_CREDENTIALS). См. bilety/docs/yandex_cloud.md"
+          if [ -z "$A" ] || [ -z "$E" ]; then
+            echo "::warning::Деплой BiletY пропущен: секреты BiletY ещё не заданы (нужны BILETY_PASSWORD_HASH и другие). См. bilety/docs/yandex_cloud.md"
             echo "skip=1" >> $GITHUB_OUTPUT; exit 0
           fi
           if [ -n "$missing" ]; then echo "::error::Не заданы секреты:$missing (см. bilety/docs/yandex_cloud.md)"; exit 1; fi

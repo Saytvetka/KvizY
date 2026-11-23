@@ -528,6 +528,17 @@ def make_questions(material: str, note: str, params: dict, rid: str, title: str,
                 collect(data, k - got)
             except AIError:
                 pass
+    if 0 < len(good) < n:  # всё ещё не хватает — ещё один запрос по самой большой части
+        ch = max(parts, key=len)
+        say("добираю недостающие вопросы…")
+        counts3 = type_counts(n - len(good), level)
+        try:
+            data = ai.ask_json("questions", prompts.questions(ch, counts3, level, note, avoid=[q["text"] for q in good]),
+                               expect=("questions",), result_id=rid, result_title=title, max_tokens=out_tokens,
+                               mock=lambda: mockai.questions(ch, counts3, shift=len(good) + 3))
+            collect(data, n - len(good))
+        except AIError:
+            pass
     warnings = []
     if not good:
         raise WorkError("ИИ не прислал ни одного годного вопроса. Нажми «Повторить».")

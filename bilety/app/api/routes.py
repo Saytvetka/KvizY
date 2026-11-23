@@ -199,7 +199,11 @@ def create_result(body: ResultIn, user_id: str = User):
     if rest and body.func != "answer":
         body.note = (body.note + "\n" if body.note.strip() else "") + f"Читать только: {rest}"
     tokens = estimate_tokens(material)
-    if tokens > 60_000 and body.func != "answer":
+    try:
+        one_request = pipeline.limits(ai.get_provider())[1]
+    except AIError:
+        one_request = 20_000
+    if tokens > one_request and body.func != "answer":
         warnings.append("Материал большой: ИИ будет работать по частям, это дольше и дороже.")
     rid = new_id()
     with SessionLocal() as s:

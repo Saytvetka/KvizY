@@ -191,3 +191,16 @@ def test_password_change_logs_out_others(client, app_client):
     auth.forget_cache()
     assert other.get("/api/bootstrap").status_code == 401        # другое — вышло
     assert client.post("/api/password", json={"old": "new-pass-1", "new": "test-pass"}).status_code == 200
+
+
+def test_big_material_goes_in_parts(client):
+    """Материал больше одного запроса: ИИ работает по частям, результат склеивается, вопросов ровно сколько заказано."""
+    text = "\n".join(f"## Раздел {i}\n" + samples.LECTURE_1.replace("Электролиз", f"Процесс{i}") for i in range(200))
+    assert len(text) > 90_000
+    d = make(client, "tickets", text=text)
+    assert len(d["content"]["tickets"]) > 3 and any("частям" in w for w in d["warnings"])
+    client.put("/api/settings/quiz", json={"count": 12})
+    d = make(client, "questions", text=text)
+    assert len(d["content"]["questions"]) == 12
+    d = make(client, "answer", text=text, note="Что применяют для получения алюминия?")
+    assert d["content"]["partial"] is True and d["content"]["found"] is True
